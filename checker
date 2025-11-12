@@ -1,6 +1,7 @@
 # Sharpe-first optimizer for differenced series (P_t - P_{t-1})
-# Priorities: Sharpe >> positive skew (optionally hard) > negative excess kurtosis (soft or hard).
+# Priorities: Sharpe >> positive skew (optional hard) > negative excess kurtosis (optional hard).
 # ONLY stats_df['target_mean'] is forecast; σ/Σ/skew/kurt from historical returns; Σ scaled by α².
+
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, Tuple
 import numpy as np
@@ -47,14 +48,15 @@ class Opts:
 
     # Shape prefs (Sharpe >> skew > neg. excess kurt)
     lam_skew: float = 0.30      # soft weight (LBFGS mode)
-    s_target: float = 0.0       # skew target (hard if hard_skew=True)
+    s_target: float = 0.0       # skew target (hard if enabled)
     lam_kurt: float = 0.10      # soft (tertiary)
     k_target: float = 0.0       # prefer exkurt <= k_target (usually 0)
 
-    # Mode switches (SLSQP used if either hard_* is True)
-    hard_skew: bool = False
-    hard_kurt: bool = False     # NEW: hard constraint exkurt <= k_target
-    enforce_constraints: bool = False  # legacy; if True -> hard_skew=True
+    # Mode switches
+    hard_skew: bool = False           # enforce skew >= s_target
+    hard_kurt: bool = False           # enforce exkurt <= k_target
+    set_all_constraints: bool = False # NEW: if True, enforce BOTH hard skew & hard kurt
+    enforce_constraints: bool = False # legacy; if True -> hard_skew=True
 
     # LBFGS soft-mode nudges (ignored by SLSQP hard-constraints)
     lam_abs_sum: float = 25.0
@@ -63,10 +65,10 @@ class Opts:
     # Solver / safety
     n_run: int = 4
     restart_seed: int = 123
-    Maxiter: int = 1000         # ↑ default iteration budget
+    Maxiter: int = 1000
     tol: float = 1e-6
     atol: float = 1e-6
-    max_fun_eval_per_run: int = 200000  # ↑ allow more evals
+    max_fun_eval_per_run: int = 200_000
 
     # L-BFGS-B tuning (↑ iterations by default)
     lbfgs_ftol: float = 1e-14
@@ -74,8 +76,11 @@ class Opts:
     lbfgs_maxls: int = 200
 
     # SLSQP tuning (↑ iterations by default)
-    slsqp_maxiter: Optional[int] = None  # None -> use Maxiter
+    slsqp_maxiter: Optional[int] = None  # None → use Maxiter
     slsqp_ftol: Optional[float] = 1e-10  # smaller than tol for longer runs
+
+    # Hard mode multi-start inside each run
+    hard_attempts_per_run: int = 3
 
     # Printing (every iteration; print best Sharpe-so-far only)
     print_progress: bool = True
@@ -88,7 +93,7 @@ class PortfolioOptimizer:
         self.T, self.N = self.R.shape
         self.opts = self._normalize_opts(opts)
 
-        # forward-looking mean
+        # forward-looking mean (only forecasted thing)
         if 'target_mean' not in stats_df.columns:
             raise ValueError("stats_df must include 'target_mean'.")
         self.mu_f = np.asarray(stats_df['target_mean'].values, dtype=float).reshape(-1)
@@ -109,7 +114,7 @@ class PortfolioOptimizer:
         # α² scaling for Sharpe realism (means untouched)
         self.alpha_scale = self._compute_alpha_from_means(self.mu_f, self.mu_h, self.opts.moment_scale_clip)
         self.cov_eff = (self.alpha_scale ** 2) * cov_shrunk
-        self.cov_eff = 0.5 * (self.cov_eff + self.cov_eff.T)
+        self.cov_eff = 0.5 * (self.cov_eff + self.cov_eff.T)  # symmetrize
 
         # cache & shrinkers
         self._R_vals = self.R.values
@@ -124,7 +129,8 @@ class PortfolioOptimizer:
 
     # --------------- public API ---------------
     def solve_max_sharpe(self) -> Dict[str, Any]:
-        hard_mode = bool(self.opts.hard_skew or self.opts.hard_kurt or self.opts.enforce_constraints)
+        hs, hk = self._effective_constraint_flags()
+        hard_mode = bool(hs or hk)
         return self._solve_slsqp_hard() if hard_mode else self._solve_lbfgs_soft()
 
     # --------------- LBFGS (soft) ---------------
@@ -237,51 +243,90 @@ class PortfolioOptimizer:
             self._best_in_run = {"sharpe": float(model_sharpe), "skew": float(skew), "kurt": float(exkurt), "w": w_proj.copy()}
         return -obj
 
-    # --------------- SLSQP (hard skew/kurt) ---------------
+    # --------------- SLSQP (hard constraints) ---------------
     def _solve_slsqp_hard(self) -> Dict[str, Any]:
+        """Max Sharpe subject to hard skew/kurt constraints. No soft fallback; only feasible solutions are accepted."""
+        hs, hk = self._effective_constraint_flags()
         global_best = None
+
         for run_idx in range(int(self.opts.n_run)):
-            w_ws = self._analytic_warm_start()
-            v0 = self._w_to_simplex_uv(w_ws)
-            bounds = [(0.0, 1.0)] * (2 * self.N)
+            best_feasible_this_run = None
 
-            cons = [{"type": "eq", "fun": lambda v: np.sum(v) - 1.0}]
-            if self.opts.hard_skew or self.opts.enforce_constraints:
-                cons.append({"type": "ineq", "fun": lambda v: self._skew_constraint_v(v)})
-            if self.opts.hard_kurt:
-                cons.append({"type": "ineq", "fun": lambda v: self._kurt_constraint_v(v)})  # exkurt <= k_target
+            for attempt in range(int(self.opts.hard_attempts_per_run)):
+                # start: analytic on attempt 0; random Dirichlet thereafter
+                if attempt == 0:
+                    w_ws = self._analytic_warm_start()
+                    v0 = self._w_to_simplex_uv(w_ws)
+                else:
+                    rng = np.random.default_rng(int(self.opts.restart_seed) + 10_000 * run_idx + attempt)
+                    v0 = rng.dirichlet(np.ones(2 * self.N))
 
-            cb = self._make_callback_slsqp(run_idx)
-            res = optimize.minimize(
-                fun=self._neg_objective_v, x0=v0, method="SLSQP",
-                bounds=bounds, constraints=cons, callback=cb,
-                options={
-                    "maxiter": int(self.opts.slsqp_maxiter or self.opts.Maxiter),
-                    "ftol": float(self.opts.slsqp_ftol if self.opts.slsqp_ftol is not None else self.opts.tol),
-                    "disp": False
-                }
-            )
+                bounds = [(0.0, 1.0)] * (2 * self.N)
+                cons = [{"type": "eq", "fun": lambda v: np.sum(v) - 1.0}]
+                if hs:
+                    cons.append({"type": "ineq", "fun": lambda v: self._skew_constraint_v(v)})   # skew ≥ s_target
+                if hk:
+                    cons.append({"type": "ineq", "fun": lambda v: self._kurt_constraint_v(v)})   # exkurt ≤ k_target
 
-            if not bool(getattr(res, "success", False)):
-                # silent per-run soft fallback
-                best = self._lbfgs_single_run(seed=int(self.opts.restart_seed) + run_idx,
-                                              run_idx=run_idx, use_analytic_start=False)
-            else:
-                v = res.x
-                w = v[:self.N] - v[self.N:]
-                w_best = _l1_project_to_sum_abs_one(w)
-                stats = self._portfolio_stats(w_best)
-                best = {"sharpe": stats["model_sharpe"], "skew": stats["skew"], "kurt": stats["kurt"], "w": w_best}
+                cb = self._make_callback_slsqp(run_idx)
+                res = optimize.minimize(
+                    fun=self._neg_objective_v, x0=v0, method="SLSQP",
+                    bounds=bounds, constraints=cons, callback=cb,
+                    options={
+                        "maxiter": int(self.opts.slsqp_maxiter or self.opts.Maxiter),
+                        "ftol": float(self.opts.slsqp_ftol if self.opts.slsqp_ftol is not None else self.opts.tol),
+                        "disp": False
+                    }
+                )
 
-            if (global_best is None) or (best["sharpe"] > global_best["sharpe"]):
-                global_best = {**best, "run": run_idx, "method": "SLSQP (hard)"}
+                # If solver produced a candidate, check feasibility explicitly on projected weights.
+                if hasattr(res, "x"):
+                    v = res.x
+                    w = v[:self.N] - v[self.N:]
+                    w_proj = _l1_project_to_sum_abs_one(w)
+                    stats = self._portfolio_stats(w_proj)
+                    feasible = True
+                    if hs and (stats["skew"] < self.opts.s_target - 1e-6):
+                        feasible = False
+                    if hk and (stats["kurt"] > self.opts.k_target + 1e-6):
+                        feasible = False
+
+                    if feasible:
+                        cand = {"sharpe": stats["model_sharpe"], "skew": stats["skew"], "kurt": stats["kurt"], "w": w_proj}
+                        if (best_feasible_this_run is None) or (cand["sharpe"] > best_feasible_this_run["sharpe"]):
+                            best_feasible_this_run = cand
+
+                if best_feasible_this_run is not None:
+                    break  # move to next run
+
+            # Run summary
             if self.opts.print_progress:
-                print(f"[Run {run_idx}] best Sharpe={best['sharpe']:.6f} skew={best['skew']:.6f} kurt={best['kurt']:.6f}")
+                if best_feasible_this_run is not None:
+                    print(f"[Run {run_idx}] best Sharpe={best_feasible_this_run['sharpe']:.6f} "
+                          f"skew={best_feasible_this_run['skew']:.6f} kurt={best_feasible_this_run['kurt']:.6f}")
+                else:
+                    print(f"[Run {run_idx}] no feasible solution under hard constraints; continuing.")
+
+            # Update global best only with feasible candidates
+            if best_feasible_this_run is not None:
+                if (global_best is None) or (best_feasible_this_run["sharpe"] > global_best["sharpe"]):
+                    global_best = {**best_feasible_this_run, "run": run_idx, "method": "SLSQP (hard)"}
+
+        if global_best is None:
+            w_fail = self._analytic_warm_start()
+            stats_fail = self._portfolio_stats(w_fail)
+            return self._package_result(
+                w_fail, stats_fail, ok=False,
+                status="No feasible solution under hard constraints",
+                method="SLSQP (hard)"
+            )
 
         w_opt = global_best["w"]
         stats = self._portfolio_stats(w_opt)
-        return self._package_result(w_opt, stats, ok=True, status="OK",
-                                    method=f"{global_best['method']} (best_run={global_best['run']})")
+        return self._package_result(
+            w_opt, stats, ok=True, status="OK",
+            method=f"{global_best['method']} (best_run={global_best['run']})"
+        )
 
     def _make_callback_slsqp(self, run_idx: int):
         state = {"it": 0}
@@ -349,10 +394,12 @@ class PortfolioOptimizer:
         den_q = float(np.dot(w, self.cov_eff @ w)); den = float(np.sqrt(max(den_q, 1e-16)))
         num = float(np.dot(self.mu_f, w))
         model_sharpe = num / den if den > 0 else np.nan
+
         r_p = self._R_vals @ w
         r_mean = float(np.mean(r_p)) if r_p.size else np.nan
         r_std = float(np.std(r_p, ddof=1)) if r_p.size > 1 else np.nan
         realized_sharpe = r_mean / r_std if (np.isfinite(r_std) and r_std > 0) else np.nan
+
         skew = self._shrunk_skew(r_p)
         exkurt = self._shrunk_exkurt(r_p)
         return {"mean_vec": self.mu_f.copy(), "std": std_vec, "model_sharpe": model_sharpe,
@@ -418,11 +465,19 @@ class PortfolioOptimizer:
         return float(np.clip(ratio, lo, hi))
 
     def _normalize_opts(self, opts: Opts) -> Opts:
+        # support alias
         if getattr(opts, "lam_concentraition", None) is not None:
             opts.lam_concentration = float(opts.lam_concentraition)
+        # legacy flag
         if getattr(opts, "enforce_constraints", False):
             opts.hard_skew = True
         return opts
+
+    def _effective_constraint_flags(self) -> Tuple[bool, bool]:
+        """Combine flags so set_all_constraints enforces BOTH hard constraints."""
+        hs = bool(self.opts.hard_skew or self.opts.enforce_constraints or self.opts.set_all_constraints)
+        hk = bool(self.opts.hard_kurt or self.opts.set_all_constraints)
+        return hs, hk
 
     @staticmethod
     def _sanitize_returns_df(df_like) -> pd.DataFrame:
@@ -439,13 +494,12 @@ class PortfolioOptimizer:
 
     def _package_result(self, w_opt: np.ndarray, stats: Dict[str, Any], ok: bool, status: str, method: str) -> Dict[str, Any]:
         gross_ok = np.isclose(np.sum(np.abs(w_opt)), 1.0, atol=self.opts.atol)
-        hard_sk = bool(self.opts.hard_skew or self.opts.enforce_constraints)
-        hard_ku = bool(self.opts.hard_kurt)
-        skew_ok = (not hard_sk) or (stats["skew"] >= self.opts.s_target - 1e-6)
-        kurt_ok = (not hard_ku) or (stats["kurt"] <= self.opts.k_target + 1e-6)
+        hs, hk = self._effective_constraint_flags()
+        skew_ok = (not hs) or (stats["skew"] >= self.opts.s_target - 1e-6)
+        kurt_ok = (not hk) or (stats["kurt"] <= self.opts.k_target + 1e-6)
         return {
             "ok": bool(ok and gross_ok and skew_ok and kurt_ok),
-            "status": "OK",                   # no solver messages shown
+            "status": status,                    # "OK" or infeasible message
             "method": method,
             "weights": pd.Series(w_opt, index=self.asset_names),
             "mean": stats["mean_vec"],
