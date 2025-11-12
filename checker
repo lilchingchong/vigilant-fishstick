@@ -1,0 +1,375 @@
+# Sharpe-first optimizer for differenced-price series (P_t - P_{t-1})
+# Priorities: Sharpe >> positive skew (optionally hard) > negative excess kurtosis (soft/light).
+# - ONLY stats_df['target_mean'] is forecast.
+# - Historical covariance: diagonal shrink + tiny ridge, then scaled by alpha^2 from |mu_f| vs |mu_h|.
+# - Skew/kurt: historical, standardized, shrunk (sample-size ridge + extrapolation taper).
+# - Two solve modes:
+#   * hard_skew=True (or enforce_constraints=True) -> SLSQP, hard skew (skew >= s_target), objective on L1-projected weights.
+#   * hard_skew=False -> LBFGS (soft), exact L1 projection after optimization.
+
+from dataclasses import dataclass
+from typing import Optional, Dict, Any, Tuple
+import numpy as np
+import pandas as pd
+from scipy import optimize, stats as scistats
+
+# ---------------------- Smooth helpers ---------------------- #
+def _softplus(x: float, beta: float = 40.0) -> float:
+    b = float(beta)
+    if x > 0:
+        return (1.0 / b) * (np.log1p(np.exp(-b * x)) + b * x)
+    else:
+        return (1.0 / b) * np.log1p(np.exp(b * x))
+
+def _softmax(z: np.ndarray) -> np.ndarray:
+    z = np.asarray(z, dtype=float)
+    m = np.max(z)
+    e = np.exp(z - m)
+    return e / np.clip(e.sum(), 1e-16, None)
+
+def _l1_project_to_sum_abs_one(w: np.ndarray, eps: float = 1e-16) -> np.ndarray:
+    s = float(np.sum(np.abs(w)))
+    if s <= eps:
+        n = w.shape[0]
+        signs = np.where(np.arange(n) % 2 == 0, 1.0, -1.0)
+        return signs / float(n)
+    return w / s
+
+# --------------------------- Options ------------------------ #
+@dataclass
+class Opts:
+    # Historical moment taper (no EWM, no winsorization)
+    shrinkage: float = 0.30
+    moment_shrink_strength: float = 1.0
+    moment_scale_clip: Tuple[float, float] = (0.6, 1.8)
+    extrapolation_taper: float = 1.0
+    cov_ridge_rel: float = 1e-8
+
+    # Structure / regularization
+    lam_l2: float = 0.10
+    lam_concentration: float = 0.50
+    lam_concentraition: Optional[float] = None  # alias accepted
+    concentration_center: bool = True
+
+    # Shape prefs (Sharpe >> skew > neg. excess kurt)
+    lam_skew: float = 0.30      # soft weight (LBFGS mode only)
+    s_target: float = 0.0       # skew target (hard if hard_skew=True)
+    lam_kurt: float = 0.10      # soft (tertiary)
+    k_target: float = 0.0       # prefer exkurt <= k_target (usually 0)
+
+    # Mode switches
+    hard_skew: bool = False     # NEW: hard skew constraint toggle
+    enforce_constraints: bool = False  # legacy: if True, treated as hard_skew=True
+
+    # LBFGS soft-mode nudges (ignored by SLSQP hard-skew mode)
+    lam_abs_sum: float = 25.0
+    lam_overlap: float = 1.0
+
+    # Solver / safety
+    n_run: int = 4
+    restart_seed: int = 123
+    Maxiter: int = 400
+    tol: float = 1e-6
+    atol: float = 1e-6
+    max_fun_eval_per_run: int = 6000
+
+# ------------------------- Optimizer ------------------------ #
+class PortfolioOptimizer:
+    def __init__(self, returns: pd.DataFrame, stats_df: pd.DataFrame, opts: Opts):
+        """
+        returns: (T x N) DataFrame of differenced series (P_t - P_{t-1}), numeric.
+        stats_df: MUST include 'target_mean' (length N). All other cols ignored.
+        """
+        self.R = self._sanitize_returns_df(returns)
+        self.asset_names = list(self.R.columns)
+        self.T, self.N = self.R.shape
+        self.opts = self._normalize_opts(opts)
+
+        # Forward-looking mean (only forecast input)
+        if 'target_mean' not in stats_df.columns:
+            raise ValueError("stats_df must include 'target_mean'.")
+        self.mu_f = np.asarray(stats_df['target_mean'].values, dtype=float).reshape(-1)
+        if self.mu_f.shape[0] != self.N:
+            raise ValueError("Length of stats_df['target_mean'] must equal number of assets (returns columns).")
+
+        # Historical moments from differenced series
+        self.mu_h = np.asarray(self.R.mean(axis=0).values, dtype=float)
+        cov_h = np.asarray(self.R.cov(ddof=1).values, dtype=float)
+
+        # Covariance: diagonal shrink + tiny ridge (PD & stable)
+        theta = float(np.clip(self.opts.shrinkage, 0.0, 1.0))
+        diag_cov = np.diag(np.diag(cov_h))
+        cov_shrunk = (1.0 - theta) * cov_h + theta * diag_cov
+        diag_mean = float(max(np.mean(np.diag(cov_shrunk)), 1e-16))
+        cov_shrunk += float(self.opts.cov_ridge_rel) * diag_mean * np.eye(self.N, dtype=float)
+
+        # Alpha^2 scaling for Sharpe realism (means untouched)
+        self.alpha_scale = self._compute_alpha_from_means(self.mu_f, self.mu_h, self.opts.moment_scale_clip)
+        self.cov_eff = (self.alpha_scale ** 2) * cov_shrunk
+        self.cov_eff = 0.5 * (self.cov_eff + self.cov_eff.T)
+
+        # Cache for speed
+        self._R_vals = self.R.values
+
+        # Standardized higher-moment shrink factors
+        self.skew_shrink, self.kurt_shrink = self._standardized_moment_shrink_factors(
+            T=self.T, theta_diag=theta, c=self.opts.moment_shrink_strength,
+            alpha=self.alpha_scale, extra=self.opts.extrapolation_taper
+        )
+
+        # Safety counter (LBFGS mode)
+        self._feval_count = 0
+
+    # ----------------------------- Public API ----------------------------- #
+    def solve_max_sharpe(self) -> Dict[str, Any]:
+        """Route to SLSQP (hard skew) or LBFGS (soft) per opts.hard_skew / enforce_constraints."""
+        hard = bool(self.opts.hard_skew or self.opts.enforce_constraints)
+        return self._solve_slsqp_hard_skew() if hard else self._solve_lbfgs_soft()
+
+    # -------------------------- LBFGS (soft) ------------------------------ #
+    def _solve_lbfgs_soft(self) -> Dict[str, Any]:
+        rng = np.random.default_rng(self.opts.restart_seed)
+        best = {"fun": np.inf, "z": None, "res": None}
+        for _ in range(int(self.opts.n_run)):
+            self._feval_count = 0
+            z0 = rng.normal(0.0, 0.5, size=2 * self.N)  # logits
+            res = optimize.minimize(
+                fun=self._neg_objective_z,
+                x0=z0,
+                method="L-BFGS-B",
+                options={"maxiter": int(self.opts.Maxiter)}
+            )
+            if (getattr(res, "success", False) or np.isfinite(getattr(res, "fun", np.inf))) and res.fun < best["fun"]:
+                best = {"fun": res.fun, "z": res.x.copy(), "res": res}
+
+        # Decode & exact ∑|w|=1 projection
+        s = _softmax(best["z"]) if best["z"] is not None else np.ones(2 * self.N) / (2 * self.N)
+        w = s[:self.N] - s[self.N:]
+        w_opt = _l1_project_to_sum_abs_one(w)
+
+        stats = self._portfolio_stats(w_opt)
+        ok_flag = (best["z"] is not None) if best["res"] is None else bool(getattr(best["res"], "success", True))
+        status_msg = best["res"].message if (best["res"] is not None and hasattr(best["res"], "message")) else ("Optimal" if best["z"] is not None else "Fallback")
+        return self._package_result(w_opt, stats, ok_flag, status_msg, method="L-BFGS-B (soft)")
+
+    def _neg_objective_z(self, z: np.ndarray) -> float:
+        self._feval_count += 1
+        if self._feval_count > int(self.opts.max_fun_eval_per_run):
+            return 1e12
+        s = _softmax(z)
+        u_plus = s[:self.N]; u_minus = s[self.N:]
+        w = u_plus - u_minus
+
+        # Sharpe
+        num = float(np.dot(self.mu_f, w))
+        den_q = float(np.dot(w, self.cov_eff @ w)); den = float(np.sqrt(max(den_q, 1e-16)))
+        model_sharpe = num / den if den > 0 else -1e12
+
+        # Shape (historical, shrunk)
+        r_p = self._R_vals @ w
+        skew = self._shrunk_skew(r_p); exkurt = self._shrunk_exkurt(r_p)
+
+        # Soft nudges (secondary/tertiary)
+        p_skew = self.opts.lam_skew * (_softplus(self.opts.s_target - skew)) ** 2
+        p_kurt = self.opts.lam_kurt * (_softplus(exkurt - self.opts.k_target)) ** 2
+
+        # Encourage ∑|w|≈1 + discourage overlap (soft, since we project after)
+        abs_sum = float(np.sum(np.sqrt(w * w + 1e-12)))
+        p_abs = self.opts.lam_abs_sum * (abs_sum - 1.0) ** 2
+        p_overlap = self.opts.lam_overlap * float(np.sum(u_plus * u_minus))
+
+        # Regularizers
+        l2_pen = self.opts.lam_l2 * float(np.dot(w, w))
+        g = np.abs(w); herf = float(np.sum(g * g)) - (1.0 / self.N if self.opts.concentration_center else 0.0)
+        conc_pen = self._lam_concentration() * herf
+
+        objective = model_sharpe - (p_skew + p_kurt + p_abs + p_overlap + l2_pen + conc_pen)
+        return -objective
+
+    # ----------------------- SLSQP (hard skew) ----------------------------- #
+    def _solve_slsqp_hard_skew(self) -> Dict[str, Any]:
+        """
+        Hard skew constraint: skew(w_proj) >= s_target, with w_proj = L1_project(u+ - u-).
+        We also add a simplex equality ∑(u+ + u-) = 1 so v stays well-behaved; final weights use w_proj,
+        guaranteeing ∑|w| = 1 and satisfying the skew constraint on the SAME weights we return.
+        """
+        rng = np.random.default_rng(self.opts.restart_seed)
+        best = {"fun": np.inf, "v": None, "res": None}
+        bounds = [(0.0, 1.0)] * (2 * self.N)
+        cons = [
+            {"type": "eq",   "fun": lambda v: np.sum(v) - 1.0},             # simplex on (u+,u-)
+            {"type": "ineq", "fun": lambda v: self._skew_constraint_v(v)}   # skew(w_proj) - s_target >= 0
+        ]
+        for _ in range(int(self.opts.n_run)):
+            v0 = rng.dirichlet(alpha=np.ones(2 * self.N))
+            res = optimize.minimize(
+                fun=self._neg_objective_v, x0=v0, method="SLSQP",
+                bounds=bounds, constraints=cons,
+                options={"maxiter": int(self.opts.Maxiter), "ftol": float(self.opts.tol), "disp": False}
+            )
+            if (getattr(res, "success", False) or np.isfinite(getattr(res, "fun", np.inf))) and res.fun < best["fun"]:
+                best = {"fun": res.fun, "v": res.x.copy(), "res": res}
+
+        # Fallback to soft mode if SLSQP fails
+        if best["v"] is None or not getattr(best["res"], "success", False):
+            soft = self._solve_lbfgs_soft()
+            soft["method"] = "SLSQP→LBFGS fallback"
+            return soft
+
+        # Decode to weights (use projected weights, consistent with constraint)
+        v = best["v"]; u_plus = v[:self.N]; u_minus = v[self.N:]
+        w = u_plus - u_minus
+        w_opt = _l1_project_to_sum_abs_one(w)
+
+        stats = self._portfolio_stats(w_opt)
+        ok_flag = bool(getattr(best["res"], "success", True))
+        status_msg = best["res"].message if hasattr(best["res"], "message") else "Optimal"
+        return self._package_result(w_opt, stats, ok_flag, status_msg, method="SLSQP (hard skew)")
+
+    def _neg_objective_v(self, v: np.ndarray) -> float:
+        """Objective for SLSQP in split-variable space; evaluate on L1-projected weights."""
+        u_plus = v[:self.N]; u_minus = v[self.N:]; w = u_plus - u_minus
+        w_proj = _l1_project_to_sum_abs_one(w)
+
+        # Sharpe on projected weights (the ones we return & constrain)
+        num = float(np.dot(self.mu_f, w_proj))
+        den_q = float(np.dot(w_proj, self.cov_eff @ w_proj)); den = float(np.sqrt(max(den_q, 1e-16)))
+        model_sharpe = num / den if den > 0 else -1e12
+
+        # Optional tertiary soft kurtosis on projected weights
+        r_p = self._R_vals @ w_proj
+        exkurt = self._shrunk_exkurt(r_p)
+        p_kurt = self.opts.lam_kurt * (_softplus(exkurt - self.opts.k_target)) ** 2
+
+        # Regularizers
+        l2_pen = self.opts.lam_l2 * float(np.dot(w_proj, w_proj))
+        g = np.abs(w_proj); herf = float(np.sum(g * g)) - (1.0 / self.N if self.opts.concentration_center else 0.0)
+        conc_pen = self._lam_concentration() * herf
+
+        objective = model_sharpe - (p_kurt + l2_pen + conc_pen)
+        return -objective
+
+    def _skew_constraint_v(self, v: np.ndarray) -> float:
+        """Hard skew constraint evaluated on the SAME projected weights we'll return."""
+        u_plus = v[:self.N]; u_minus = v[self.N:]; w = u_plus - u_minus
+        w_proj = _l1_project_to_sum_abs_one(w)
+        r_p = self._R_vals @ w_proj
+        skew = self._shrunk_skew(r_p)
+        return float(skew - self.opts.s_target + self.opts.atol)
+
+    # -------------------------- Stats / helpers --------------------------- #
+    def _portfolio_stats(self, w: np.ndarray) -> Dict[str, float]:
+        std_vec = np.sqrt(np.clip(np.diag(self.cov_eff), 1e-32, None))
+        den_q = float(np.dot(w, self.cov_eff @ w))
+        den = float(np.sqrt(max(den_q, 1e-16)))
+        num = float(np.dot(self.mu_f, w))
+        model_sharpe = num / den if den > 0 else np.nan
+
+        r_p = self._R_vals @ w
+        r_mean = float(np.mean(r_p)) if r_p.size else np.nan
+        r_std = float(np.std(r_p, ddof=1)) if r_p.size > 1 else np.nan
+        realized_sharpe = r_mean / r_std if (np.isfinite(r_std) and r_std > 0) else np.nan
+
+        skew = self._shrunk_skew(r_p)
+        exkurt = self._shrunk_exkurt(r_p)
+
+        return {
+            "mean_vec": self.mu_f.copy(),
+            "std": std_vec,
+            "model_sharpe": model_sharpe,
+            "realized_sharpe": realized_sharpe,
+            "skew": skew,
+            "kurt": exkurt
+        }
+
+    def _shrunk_skew(self, r: np.ndarray) -> float:
+        if r.size < 3:
+            return 0.0
+        s = float(scistats.skew(r, bias=False))
+        if not np.isfinite(s):
+            return 0.0
+        return float(self.skew_shrink * s)
+
+    def _shrunk_exkurt(self, r: np.ndarray) -> float:
+        if r.size < 4:
+            return 0.0
+        k = float(scistats.kurtosis(r, fisher=True, bias=False))
+        if not np.isfinite(k):
+            return 0.0
+        return float(self.kurt_shrink * k)
+
+    def _standardized_moment_shrink_factors(self, T: int, theta_diag: float, c: float, alpha: float, extra: float) -> Tuple[float, float]:
+        if T < 4:
+            return 0.0, 0.0
+        se2_skew = 6.0 / max(T, 1.0)
+        se2_kurt = 24.0 / max(T, 1.0)
+        ridge_skew = 1.0 / (1.0 + max(c, 0.0) * se2_skew)
+        ridge_kurt = 1.0 / (1.0 + max(c, 0.0) * se2_kurt)
+        g_alpha = 1.0 / (1.0 + max(extra, 0.0) * (alpha - 1.0) ** 2)
+        base = (1.0 - np.clip(theta_diag, 0.0, 1.0))
+        return float(base * ridge_skew * g_alpha), float(base * ridge_kurt * g_alpha)
+
+    # ------------------------------- Utils -------------------------------- #
+    def _compute_alpha_from_means(self, mu_f: np.ndarray, mu_h: np.ndarray, clip_bounds: Tuple[float, float]) -> float:
+        lo, hi = clip_bounds
+        if hi <= lo:
+            raise ValueError("moment_scale_clip must satisfy lo < hi.")
+        eps = 1e-16
+        med_h = float(np.median(np.abs(mu_h)))
+        denom = med_h if med_h > eps else eps
+        ratio = float(np.median(np.abs(mu_f))) / denom
+        return float(np.clip(ratio, lo, hi))
+
+    def _lam_concentration(self) -> float:
+        return float(self.opts.lam_concentration if self.opts.lam_concentration is not None
+                     else (self.opts.lam_concentraition if self.opts.lam_concentraition is not None else 0.0))
+
+    def _normalize_opts(self, opts: Opts) -> Opts:
+        # alias support and safety
+        if getattr(opts, "lam_concentraition", None) is not None:
+            opts.lam_concentration = float(opts.lam_concentraition)
+        # if user set enforce_constraints=True historically, treat as hard_skew=True
+        if getattr(opts, "enforce_constraints", False):
+            opts.hard_skew = True
+        return opts
+
+    @staticmethod
+    def _sanitize_returns_df(df_like) -> pd.DataFrame:
+        if not isinstance(df_like, pd.DataFrame):
+            df = pd.DataFrame(df_like)
+        else:
+            df = df_like.copy()
+        for c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        df = df.dropna(axis=1, how="all").dropna(axis=0, how="any")
+        if df.shape[1] == 0 or df.shape[0] < 2:
+            raise ValueError("returns must contain at least 2 observations and 1 numeric column after cleaning.")
+        return df
+
+    def _package_result(self, w_opt: np.ndarray, stats: Dict[str, Any], ok: bool, status: str, method: str) -> Dict[str, Any]:
+        is_valid = self._check_constraints(w_opt, stats)
+        return {
+            "ok": bool(ok),
+            "status": status,
+            "method": method,
+            "weights": pd.Series(w_opt, index=self.asset_names),
+            "mean": stats["mean_vec"],
+            "std": stats["std"],
+            "realized_sharpe": stats["realized_sharpe"],
+            "sharpe_gap": stats["model_sharpe"] - stats["realized_sharpe"],
+            "skew": stats["skew"],
+            "kurt": stats["kurt"],
+            "gross_exposure": float(np.sum(np.abs(w_opt))),
+            "max_position": float(np.max(np.abs(w_opt))),
+            "n_active_assets": int(np.sum(np.abs(w_opt) > 1e-8)),
+            "constraints_satisfied": bool(is_valid),
+            "skew_positive": bool(stats["skew"] >= 0.0),
+            "kurt_negative": bool(stats["kurt"] <= 0.0),
+        }
+
+    def _check_constraints(self, w: np.ndarray, stats: Dict[str, Any]) -> bool:
+        gross_ok = np.isclose(np.sum(np.abs(w)), 1.0, atol=self.opts.atol)
+        hard = bool(self.opts.hard_skew or self.opts.enforce_constraints)
+        skew_ok = (not hard) or (stats["skew"] >= self.opts.s_target - 1e-6)
+        kurt_ok = True  # no hard kurt constraint (tertiary preference is soft only)
+        return bool(gross_ok and skew_ok and kurt_ok)
