@@ -1,5 +1,5 @@
 # Sharpe-first optimizer for differenced series (P_t - P_{t-1})
-# Priorities: Sharpe >> positive skew (optionally hard) > negative excess kurtosis (soft).
+# Priorities: Sharpe >> positive skew (optionally hard) > negative excess kurtosis (soft or hard).
 # ONLY stats_df['target_mean'] is forecast; σ/Σ/skew/kurt from historical returns; Σ scaled by α².
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, Tuple
@@ -49,26 +49,36 @@ class Opts:
     lam_skew: float = 0.30      # soft weight (LBFGS mode)
     s_target: float = 0.0       # skew target (hard if hard_skew=True)
     lam_kurt: float = 0.10      # soft (tertiary)
-    k_target: float = 0.0       # prefer exkurt <= 0
+    k_target: float = 0.0       # prefer exkurt <= k_target (usually 0)
 
-    # Mode switches
-    hard_skew: bool = False           # optional hard skew constraint
-    enforce_constraints: bool = False # legacy; if True -> hard_skew=True
+    # Mode switches (SLSQP used if either hard_* is True)
+    hard_skew: bool = False
+    hard_kurt: bool = False     # NEW: hard constraint exkurt <= k_target
+    enforce_constraints: bool = False  # legacy; if True -> hard_skew=True
 
-    # LBFGS soft-mode nudges (ignored by SLSQP hard-skew)
+    # LBFGS soft-mode nudges (ignored by SLSQP hard-constraints)
     lam_abs_sum: float = 25.0
     lam_overlap: float = 1.0
 
     # Solver / safety
     n_run: int = 4
     restart_seed: int = 123
-    Maxiter: int = 400
+    Maxiter: int = 1000         # ↑ default iteration budget
     tol: float = 1e-6
     atol: float = 1e-6
-    max_fun_eval_per_run: int = 8000  # guard against runaway evals
+    max_fun_eval_per_run: int = 200000  # ↑ allow more evals
 
-    # Printing (no storage besides best-so-far)
-    print_progress: bool = True       # print each iteration; no solver-status prints
+    # L-BFGS-B tuning (↑ iterations by default)
+    lbfgs_ftol: float = 1e-14
+    lbfgs_gtol: float = 1e-12
+    lbfgs_maxls: int = 200
+
+    # SLSQP tuning (↑ iterations by default)
+    slsqp_maxiter: Optional[int] = None  # None -> use Maxiter
+    slsqp_ftol: Optional[float] = 1e-10  # smaller than tol for longer runs
+
+    # Printing (every iteration; print best Sharpe-so-far only)
+    print_progress: bool = True
 
 # -------------------- optimizer --------------------
 class PortfolioOptimizer:
@@ -108,16 +118,16 @@ class PortfolioOptimizer:
             alpha=self.alpha_scale, extra=self.opts.extrapolation_taper
         )
 
-        # per-run state (no history/traces kept)
+        # per-run state
         self._feval_count = 0
         self._best_in_run = None  # dict with sharpe, w, skew, kurt
 
     # --------------- public API ---------------
     def solve_max_sharpe(self) -> Dict[str, Any]:
-        hard = bool(self.opts.hard_skew or self.opts.enforce_constraints)
-        return self._solve_slsqp_hard_skew() if hard else self._solve_lbfgs_soft()
+        hard_mode = bool(self.opts.hard_skew or self.opts.hard_kurt or self.opts.enforce_constraints)
+        return self._solve_slsqp_hard() if hard_mode else self._solve_lbfgs_soft()
 
-    # --------------- LBFGS (soft skew) ---------------
+    # --------------- LBFGS (soft) ---------------
     def _solve_lbfgs_soft(self) -> Dict[str, Any]:
         global_best = None
         for run_idx in range(int(self.opts.n_run)):
@@ -145,15 +155,19 @@ class PortfolioOptimizer:
             rng = np.random.default_rng(seed)
             z0 = rng.normal(0.0, 0.7, size=2 * self.N)
 
-        # per-iteration callback (prints every iteration)
         cb = self._make_callback_lbfgs(run_idx)
-
         optimize.minimize(
             fun=self._neg_objective_z,
             x0=z0,
             method="L-BFGS-B",
             callback=cb,
-            options={"maxiter": int(self.opts.Maxiter), "maxls": 50, "disp": False}
+            options={
+                "maxiter": int(self.opts.Maxiter),
+                "maxls": int(self.opts.lbfgs_maxls),
+                "ftol": float(self.opts.lbfgs_ftol),
+                "gtol": float(self.opts.lbfgs_gtol),
+                "disp": False
+            }
         )
 
         # if no iterate recorded, fall back to initial
@@ -169,22 +183,24 @@ class PortfolioOptimizer:
     def _make_callback_lbfgs(self, run_idx: int):
         state = {"it": 0}
         def cb(xk: np.ndarray):
-            # xk are logits z at this iteration
+            # compute metrics at current iterate
             s = _softmax(xk)
             w = s[:self.N] - s[self.N:]
             w_proj = _l1_project_to_sum_abs_one(w)
-            # metrics on projected weights
             num = float(np.dot(self.mu_f, w_proj))
             den_q = float(np.dot(w_proj, self.cov_eff @ w_proj)); den = float(np.sqrt(max(den_q, 1e-16)))
             model_sharpe = num / den if den > 0 else -1e-12
             r_p = self._R_vals @ w_proj
             skew = self._shrunk_skew(r_p); exkurt = self._shrunk_exkurt(r_p)
-            # print EVERY iteration (no solver messages)
-            if self.opts.print_progress:
-                print(f"[Run {run_idx} | it {state['it']}] Sharpe={model_sharpe:.6f} skew={skew:.6f} kurt={exkurt:.6f}")
-            # keep best-so-far (no history stored)
+
+            # update best-so-far if improved
             if (self._best_in_run is None) or (model_sharpe > self._best_in_run["sharpe"] + 1e-12):
                 self._best_in_run = {"sharpe": float(model_sharpe), "skew": float(skew), "kurt": float(exkurt), "w": w_proj.copy()}
+
+            # PRINT: best Sharpe-so-far EVERY iteration (monotone)
+            if self.opts.print_progress:
+                bs = self._best_in_run
+                print(f"[Run {run_idx} | it {state['it']}] best_Sharpe={bs['sharpe']:.6f} best_skew={bs['skew']:.6f} best_kurt={bs['kurt']:.6f}")
             state["it"] += 1
         return cb
 
@@ -197,11 +213,13 @@ class PortfolioOptimizer:
         u_plus = s[:self.N]; u_minus = s[self.N:]
         w = u_plus - u_minus
         w_proj = _l1_project_to_sum_abs_one(w)
+
         # Sharpe
         num = float(np.dot(self.mu_f, w_proj))
         den_q = float(np.dot(w_proj, self.cov_eff @ w_proj)); den = float(np.sqrt(max(den_q, 1e-16)))
         model_sharpe = num / den if den > 0 else -1e-12
-        # soft nudges
+
+        # penalties/regularizers (soft, secondary/tertiary)
         r_p = self._R_vals @ w_proj
         skew = self._shrunk_skew(r_p); exkurt = self._shrunk_exkurt(r_p)
         p_skew = self.opts.lam_skew * (_softplus(self.opts.s_target - skew)) ** 2
@@ -213,31 +231,39 @@ class PortfolioOptimizer:
         g = np.abs(w_proj); herf = float(np.sum(g * g)) - (1.0 / self.N if self.opts.concentration_center else 0.0)
         conc_pen = self._lam_concentration() * herf
         obj = model_sharpe - (p_skew + p_kurt + p_abs + p_overlap + l2_pen + conc_pen)
-        # quietly keep best-so-far too (covers cases when callback is not called)
+
+        # keep best-so-far silently (covers cases when callback is not fired)
         if (self._best_in_run is None) or (model_sharpe > self._best_in_run["sharpe"] + 1e-12):
             self._best_in_run = {"sharpe": float(model_sharpe), "skew": float(skew), "kurt": float(exkurt), "w": w_proj.copy()}
         return -obj
 
-    # --------------- SLSQP (hard skew) ---------------
-    def _solve_slsqp_hard_skew(self) -> Dict[str, Any]:
+    # --------------- SLSQP (hard skew/kurt) ---------------
+    def _solve_slsqp_hard(self) -> Dict[str, Any]:
         global_best = None
         for run_idx in range(int(self.opts.n_run)):
             w_ws = self._analytic_warm_start()
             v0 = self._w_to_simplex_uv(w_ws)
             bounds = [(0.0, 1.0)] * (2 * self.N)
-            cons = [
-                {"type": "eq",   "fun": lambda v: np.sum(v) - 1.0},             # simplex on (u+,u-)
-                {"type": "ineq", "fun": lambda v: self._skew_constraint_v(v)}   # skew(w_proj) - s_target >= 0
-            ]
-            # per-iteration callback (prints every iteration)
+
+            cons = [{"type": "eq", "fun": lambda v: np.sum(v) - 1.0}]
+            if self.opts.hard_skew or self.opts.enforce_constraints:
+                cons.append({"type": "ineq", "fun": lambda v: self._skew_constraint_v(v)})
+            if self.opts.hard_kurt:
+                cons.append({"type": "ineq", "fun": lambda v: self._kurt_constraint_v(v)})  # exkurt <= k_target
+
             cb = self._make_callback_slsqp(run_idx)
             res = optimize.minimize(
                 fun=self._neg_objective_v, x0=v0, method="SLSQP",
                 bounds=bounds, constraints=cons, callback=cb,
-                options={"maxiter": int(self.opts.Maxiter), "ftol": float(self.opts.tol), "disp": False}
+                options={
+                    "maxiter": int(self.opts.slsqp_maxiter or self.opts.Maxiter),
+                    "ftol": float(self.opts.slsqp_ftol if self.opts.slsqp_ftol is not None else self.opts.tol),
+                    "disp": False
+                }
             )
-            # silent per-run fallback if SLSQP fails
+
             if not bool(getattr(res, "success", False)):
+                # silent per-run soft fallback
                 best = self._lbfgs_single_run(seed=int(self.opts.restart_seed) + run_idx,
                                               run_idx=run_idx, use_analytic_start=False)
             else:
@@ -248,7 +274,7 @@ class PortfolioOptimizer:
                 best = {"sharpe": stats["model_sharpe"], "skew": stats["skew"], "kurt": stats["kurt"], "w": w_best}
 
             if (global_best is None) or (best["sharpe"] > global_best["sharpe"]):
-                global_best = {**best, "run": run_idx, "method": "SLSQP (hard skew)"}
+                global_best = {**best, "run": run_idx, "method": "SLSQP (hard)"}
             if self.opts.print_progress:
                 print(f"[Run {run_idx}] best Sharpe={best['sharpe']:.6f} skew={best['skew']:.6f} kurt={best['kurt']:.6f}")
 
@@ -268,10 +294,15 @@ class PortfolioOptimizer:
             model_sharpe = num / den if den > 0 else -1e-12
             r_p = self._R_vals @ w_proj
             skew = self._shrunk_skew(r_p); exkurt = self._shrunk_exkurt(r_p)
-            if self.opts.print_progress:
-                print(f"[Run {run_idx} | it {state['it']}] Sharpe={model_sharpe:.6f} skew={skew:.6f} kurt={exkurt:.6f}")
+
+            # update best-so-far
             if (self._best_in_run is None) or (model_sharpe > self._best_in_run["sharpe"] + 1e-12):
                 self._best_in_run = {"sharpe": float(model_sharpe), "skew": float(skew), "kurt": float(exkurt), "w": w_proj.copy()}
+
+            # PRINT: best Sharpe-so-far EVERY iteration (monotone)
+            if self.opts.print_progress:
+                bs = self._best_in_run
+                print(f"[Run {run_idx} | it {state['it']}] best_Sharpe={bs['sharpe']:.6f} best_skew={bs['skew']:.6f} best_kurt={bs['kurt']:.6f}")
             state["it"] += 1
         return cb
 
@@ -290,18 +321,27 @@ class PortfolioOptimizer:
         g = np.abs(w_proj); herf = float(np.sum(g * g)) - (1.0 / self.N if self.opts.concentration_center else 0.0)
         conc_pen = self._lam_concentration() * herf
         obj = model_sharpe - (p_kurt + l2_pen + conc_pen)
+
         # keep best-so-far silently (in case callback not invoked)
         r_skew = self._shrunk_skew(r_p)
         if (self._best_in_run is None) or (model_sharpe > self._best_in_run["sharpe"] + 1e-12):
             self._best_in_run = {"sharpe": float(model_sharpe), "skew": float(r_skew), "kurt": float(exkurt), "w": w_proj.copy()}
         return -obj
 
+    # ---- hard constraints ----
     def _skew_constraint_v(self, v: np.ndarray) -> float:
         u_plus = v[:self.N]; u_minus = v[self.N:]; w = u_plus - u_minus
         w_proj = _l1_project_to_sum_abs_one(w)
         r_p = self._R_vals @ w_proj
         skew = self._shrunk_skew(r_p)
-        return float(skew - self.opts.s_target + self.opts.atol)
+        return float(skew - self.opts.s_target + self.opts.atol)      # skew >= s_target
+
+    def _kurt_constraint_v(self, v: np.ndarray) -> float:
+        u_plus = v[:self.N]; u_minus = v[self.N:]; w = u_plus - u_minus
+        w_proj = _l1_project_to_sum_abs_one(w)
+        r_p = self._R_vals @ w_proj
+        exkurt = self._shrunk_exkurt(r_p)
+        return float(self.opts.k_target - exkurt + self.opts.atol)    # exkurt <= k_target
 
     # --------------- stats & shrink ---------------
     def _portfolio_stats(self, w: np.ndarray) -> Dict[str, float]:
@@ -390,8 +430,6 @@ class PortfolioOptimizer:
             df = pd.DataFrame(df_like)
         else:
             df = df_like.copy()
-        for c in df.columns,:
-            pass
         for c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
         df = df.dropna(axis=1, how="all").dropna(axis=0, how="any")
@@ -401,10 +439,12 @@ class PortfolioOptimizer:
 
     def _package_result(self, w_opt: np.ndarray, stats: Dict[str, Any], ok: bool, status: str, method: str) -> Dict[str, Any]:
         gross_ok = np.isclose(np.sum(np.abs(w_opt)), 1.0, atol=self.opts.atol)
-        hard = bool(self.opts.hard_skew or self.opts.enforce_constraints)
-        skew_ok = (not hard) or (stats["skew"] >= self.opts.s_target - 1e-6)
+        hard_sk = bool(self.opts.hard_skew or self.opts.enforce_constraints)
+        hard_ku = bool(self.opts.hard_kurt)
+        skew_ok = (not hard_sk) or (stats["skew"] >= self.opts.s_target - 1e-6)
+        kurt_ok = (not hard_ku) or (stats["kurt"] <= self.opts.k_target + 1e-6)
         return {
-            "ok": bool(ok and gross_ok and skew_ok),
+            "ok": bool(ok and gross_ok and skew_ok and kurt_ok),
             "status": "OK",                   # no solver messages shown
             "method": method,
             "weights": pd.Series(w_opt, index=self.asset_names),
@@ -417,7 +457,7 @@ class PortfolioOptimizer:
             "gross_exposure": float(np.sum(np.abs(w_opt))),
             "max_position": float(np.max(np.abs(w_opt))),
             "n_active_assets": int(np.sum(np.abs(w_opt) > 1e-8)),
-            "constraints_satisfied": bool(gross_ok and skew_ok),
+            "constraints_satisfied": bool(gross_ok and skew_ok and kurt_ok),
             "skew_positive": bool(stats["skew"] >= 0.0),
             "kurt_negative": bool(stats["kurt"] <= 0.0),
         }
