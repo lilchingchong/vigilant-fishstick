@@ -1,0 +1,944 @@
+#!/usr/bin/env python3
+"""
+XCCY vs Swap‑Spreads — Δ‑only with ROLLING Z‑scores, ECM, Robust OLS, and Core Signals (v19)
+==========================================================================================
+
+Input (wide DataFrame `allData` with DateTimeIndex or first column date):
+  • US swap spreads (levels):        ss{TENOR}             e.g., ss1y, ss5y, ss3y3y
+  • Country swap spreads (levels):   {CC}ss{TENOR}         e.g., AUss1y, JPss3y3y
+  • XCCY basis vs USD (levels):      {CC}_XCCY_{TENOR}     e.g., AU_XCCY_1y, JP_XCCY_3y3y
+
+Design principles (checked line‑by‑line):
+  • Single resample in the batch runner only (allowed: 'D', 'W', 'M'; default 'D').
+  • All inference on **Δ levels → rolling‑z** (standard deviation z). ECM/cointegration on **levels**.
+  • Lead–lag uses Corr(y_t, x_{t−k}); **k>0 ⇒ x leads y**. Gated by multiple‑testing‑adjusted p<α and |r|≥τ.
+  • Seasonality = **follow the historical tilt** (no contrarian). Clear month bars with significance.
+  • Plots show on screen only (no files). Clean style, no emojis.
+  • Robustness: optional winsorised Δ, HAC errors, NaN‑safe.
+
+Per (country, tenor) we compute & print:
+  • Corr(zΔXCCY, zΔDIFF / zΔCC / zΔUS); HAC OLS in z‑space (DIFF, CC, US);
+  • AR(1) momentum/mean‑reversion (half‑life), seasonality (month & DOW),
+  • Best causal lead–lag (DIFF→XCCY, also CC→XCCY, US→XCCY),
+  • ECM/cointegration on levels, and latest component + composite signals.
+"""
+
+from __future__ import annotations
+from dataclasses import dataclass
+from itertools import combinations
+from typing import List, Dict, Tuple, Optional
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.dates import AutoDateLocator, ConciseDateFormatter
+from scipy.stats import t as student_t, kruskal, mannwhitneyu
+import statsmodels.api as sm
+from statsmodels.tsa.stattools import adfuller
+
+# =============================
+# Settings (edit here)
+# =============================
+SETTINGS = {
+    "FREQ": "D",          # 'D', 'W', or 'M'
+    "ZWIN": 26,            # rolling‑z window (periods in chosen freq)
+    "ROLLING": 26,         # rolling correlation window
+    "MAX_LAG": 26,         # lead–lag search horizon
+    "HAC_LAGS": 5,         # Newey–West lags for OLS
+    "SIG_LEVEL": 0.05,     # p‑value threshold for seasonality / lead–lag / ECM γ
+        "DIFF_MODE": "simple",# 'simple' Δ, or 'log'/'pct' if you ever need
+    "WINSOR_LIMITS": (0.01, 0.01), # tail winsor on Δ; set None to disable
+    "FLIP_BASIS": False,   # True only if your XCCY sign convention needs flipping
+    "DO_PLOTS": True,
+}
+
+# =============================
+# Global plotting style
+# =============================
+
+def apply_matplotlib_style():
+    plt.rcParams.update({
+        "figure.autolayout": True,
+        "axes.facecolor": "#FFFFFF",
+        "figure.facecolor": "#FFFFFF",
+        "axes.grid": True,
+        "grid.alpha": 0.25,
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+        "axes.titlesize": 12,
+        "axes.labelsize": 11,
+        "font.size": 10,
+        "legend.frameon": False,
+        "lines.linewidth": 1.4,
+    })
+
+COL = {
+    "xccy": "#1f77b4",
+    "diff": "#ff7f0e",
+    "cc":   "#2ca02c",
+    "us":   "#d62728",
+    "spread": "#9467bd",
+    "fit":  "#8c564b",
+    "bars": "#4e79a7",
+    "neg":  "#e15759",
+}
+
+apply_matplotlib_style()
+
+# =============================
+# Utilities
+# =============================
+
+def ensure_datetime_index(df: pd.DataFrame) -> pd.DataFrame:
+    if isinstance(df.index, pd.DatetimeIndex):
+        return df.sort_index()
+    c0 = df.columns[0]
+    out = df.copy()
+    out[c0] = pd.to_datetime(out[c0])
+    return out.set_index(c0).sort_index()
+
+
+def resample_and_fill(df: pd.DataFrame, freq: str) -> pd.DataFrame:
+    """Only allow 'D', 'W', 'M'. Use last observation and forward‑fill."""
+    f = freq.upper().strip()
+    if f not in {"D", "W", "M"}:
+        raise ValueError("freq must be one of 'D', 'W', 'M'")
+    out = df.resample(f).last().ffill()
+    return out
+
+
+def validate_spec(allData: pd.DataFrame, countries: List[str], tenors: List[str]) -> None:
+    missing = []
+    for cc in countries:
+        for tn in tenors:
+            for col in (f"ss{tn}", f"{cc}ss{tn}", f"{cc}_XCCY_{tn}"):
+                if col not in allData.columns:
+                    missing.append(col)
+    if missing:
+        print("[WARN] Missing columns detected (first 20 shown):", missing[:20])
+
+
+def overlap(a: pd.Series, b: pd.Series) -> Tuple[pd.Series, pd.Series]:
+    idx = a.dropna().index.intersection(b.dropna().index)
+    idx = idx.sort_values()
+    return a.loc[idx], b.loc[idx]
+
+
+def winsorize_series(s: pd.Series, limits: Optional[Tuple[float, float]]) -> pd.Series:
+    if not limits:
+        return s
+    lo, hi = limits
+    qlo = s.quantile(lo) if lo is not None else None
+    qhi = s.quantile(1 - hi) if hi is not None else None
+    lower = qlo if (qlo is not None and pd.notna(qlo)) else None
+    upper = qhi if (qhi is not None and pd.notna(qhi)) else None
+    if lower is None and upper is None:
+        return s
+    return s.clip(lower=lower, upper=upper)
+
+
+def diff_series(s: pd.Series, mode: str = "simple") -> pd.Series:
+    if mode == "simple":
+        return s.diff()
+    elif mode == "log":
+        valid = (s > 0)
+        out = pd.Series(index=s.index, dtype=float)
+        out[valid] = np.log(s[valid]).diff()
+        return out
+    elif mode == "pct":
+        return s.pct_change()
+    else:
+        raise ValueError(f"Unknown diff mode: {mode}")
+
+
+def _date_fmt(ax):
+    loc = AutoDateLocator(minticks=5, maxticks=8)
+    ax.xaxis.set_major_locator(loc)
+    ax.xaxis.set_major_formatter(ConciseDateFormatter(loc))
+
+
+def rolling_z(series: pd.Series, window: int) -> pd.Series:
+    s = series.astype(float)
+    if window is None or window <= 1:
+        return (s - s.mean()) / s.std(ddof=1)
+    minp = max(10, window // 3)
+    m = s.rolling(window, min_periods=minp).mean()
+    v = s.rolling(window, min_periods=minp).std(ddof=1)
+    z = (s - m) / v
+    return z.replace([np.inf, -np.inf], np.nan)
+
+
+def corr_and_p(x: pd.Series, y: pd.Series) -> Tuple[float, float, int]:
+    x, y = overlap(x, y)
+    n = len(x)
+    if n < 10:
+        return (np.nan, np.nan, n)
+    r = float(x.corr(y))
+    if not np.isfinite(r):
+        return (np.nan, np.nan, n)
+    tstat = r * np.sqrt((n - 2) / max(1e-12, 1 - r * r))
+    p = 2 * (1 - student_t.cdf(abs(tstat), df=n - 2))
+    return (r, float(p), n)
+
+
+def ols_xy_hac(x: pd.Series, y: pd.Series, hac_lags: int = 5) -> Dict[str, float]:
+    df = pd.concat([x, y], axis=1).dropna()
+    if df.shape[0] < 20:
+        return {k: np.nan for k in ["alpha", "beta", "r2", "t_beta", "p_beta", "n", "sigma2"]}
+    X = sm.add_constant(df.iloc[:, 0].values)
+    Y = df.iloc[:, 1].values
+    res = sm.OLS(Y, X).fit(cov_type="HAC", cov_kwds={"maxlags": hac_lags})
+    return {
+        "alpha": float(res.params[0]),
+        "beta": float(res.params[1]),
+        "r2": float(res.rsquared),
+        "t_beta": float(res.tvalues[1]),
+        "p_beta": float(res.pvalues[1]),
+        "n": int(df.shape[0]),
+        "sigma2": float(res.scale),
+    }
+
+
+def ar1_phi(series: pd.Series) -> Tuple[float, float, int, float]:
+    s = series.dropna()
+    if len(s) < 60:
+        return (np.nan, np.nan, len(s), np.nan)
+    y = s.values[1:]
+    x = s.values[:-1]
+    n = len(x)
+    X = np.column_stack([np.ones(n), x])
+    beta, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
+    phi = float(beta[1])
+    resid = y - X @ beta
+    se2 = float((resid @ resid) / max(1, n - 2))
+    cov = se2 * np.linalg.pinv(X.T @ X)
+    se_phi = float(np.sqrt(max(cov[1, 1], 0.0)))
+    tstat = phi / se_phi if se_phi > 0 else np.nan
+    p = 2 * (1 - student_t.cdf(abs(tstat), df=n - 2)) if np.isfinite(tstat) else np.nan
+    hl = np.inf
+    if 0 < abs(phi) < 1:
+        hl = float(np.log(0.5) / np.log(abs(phi)))
+    return (phi, float(p), n + 1, hl)
+
+
+def cross_correlation_lags(x: pd.Series, y: pd.Series, max_lag: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, float, float, int]:
+    """Return (lags, corrs, pvals, best_lag, best_corr, p_best, n_full).
+    r_k = Corr(y_t, x_{t−k}); positive k ⇒ x leads y."""
+    x = x.dropna(); y = y.dropna()
+    idx = x.index.intersection(y.index)
+    x = x.loc[idx]; y = y.loc[idx]
+    n_full = len(idx)
+    lags = np.arange(-max_lag, max_lag + 1)
+    corrs, pvals = [], []
+    for k in lags:
+        xs, ys = (x.shift(k), y) if k > 0 else (x, y.shift(-k)) if k < 0 else (x, y)
+        xs, ys = overlap(xs, ys)
+        if len(xs) < 30:
+            corrs.append(np.nan); pvals.append(np.nan); continue
+        r, p, _ = corr_and_p(xs, ys)
+        corrs.append(r); pvals.append(p)
+    corrs = np.array(corrs); pvals = np.array(pvals)
+    if np.all(np.isnan(corrs)):
+        return lags, corrs, pvals, np.nan, np.nan, np.nan, n_full
+    i = int(np.nanargmax(np.abs(corrs)))
+    return lags, corrs, pvals, float(lags[i]), float(corrs[i]), float(pvals[i]), n_full
+
+
+def month_kruskal(series: pd.Series) -> float:
+    s = series.dropna()
+    if s.empty:
+        return np.nan
+    groups = [s[s.index.month == m].values for m in range(1, 13)]
+    try:
+        return float(kruskal(*groups).pvalue)
+    except Exception:
+        return np.nan
+
+
+def dow_kruskal(series: pd.Series) -> float:
+    s = series.dropna()
+    if s.empty:
+        return np.nan
+    groups = [s[s.index.dayofweek == d].values for d in range(0, 7)]
+    try:
+        return float(kruskal(*groups).pvalue)
+    except Exception:
+        return np.nan
+
+# Forward‑looking seasonal template: expected direction by group (month/DOW)
+# effect_g = median(z | group=g) − median(z)
+# signal(t) = effect_{group(t)} / robust_scale(effect)
+
+def seasonal_template_signal(z_series: pd.Series, by: str = "month") -> pd.Series:
+    s = z_series.dropna()
+    if s.empty:
+        return z_series * np.nan
+    grp = s.index.month if by == "month" else s.index.dayofweek
+    overall = float(s.median())
+    effects = {}
+    for g in (range(1, 13) if by == "month" else range(0, 7)):
+        sg = s[grp == g]
+        effects[g] = float(sg.median() - overall) if len(sg) else 0.0
+    eff_vals = np.array(list(effects.values()), dtype=float)
+    scale = np.median(np.abs(eff_vals - np.median(eff_vals)))
+    if not np.isfinite(scale) or scale == 0:
+        sdev = np.std(eff_vals)
+        scale = sdev if np.isfinite(sdev) and sdev > 0 else 1.0
+    idx = z_series.index
+    if by == "month":
+        sig = pd.Series([effects.get(m, 0.0) / scale for m in idx.month], index=idx)
+    else:
+        sig = pd.Series([effects.get(d, 0.0) / scale for d in idx.dayofweek], index=idx)
+    return sig.rename((z_series.name or "z") + f"_seasonal_template_{by}")
+
+# ---- Seasonality detail: which months/days drive the effect? ----
+
+def _holm_bonferroni(pvals: Dict[int, float]) -> Dict[int, float]:
+    items = sorted(pvals.items(), key=lambda kv: kv[1])
+    m = len(items)
+    adj = {}
+    running_max = 0.0
+    for i, (g, p) in enumerate(items, start=1):
+        padj = (m - i + 1) * p
+        running_max = max(running_max, padj)
+        adj[g] = min(1.0, running_max)
+    return {g: adj[g] for g in pvals.keys()}
+
+
+def seasonality_breakdown(z_series: pd.Series, by: str = "month", alpha: float = 0.05) -> pd.DataFrame:
+    s = z_series.dropna()
+    if s.empty:
+        return pd.DataFrame()
+    grp = s.index.month if by == "month" else s.index.dayofweek
+    overall_med = float(s.median())
+    rows = []
+    for g in (range(1, 13) if by == "month" else range(0, 7)):
+        sg = s[grp == g]
+        rest = s[grp != g]
+        if len(sg) < 15 or len(rest) < 30:
+            rows.append((g, len(sg), np.nan, np.nan, np.nan, np.nan))
+            continue
+        U, p = mannwhitneyu(sg.values, rest.values, alternative="two-sided")
+        rows.append((g, len(sg), float(sg.median()), float(sg.mean()), float(U), float(p)))
+    df = pd.DataFrame(rows, columns=["group", "n", "median", "mean", "U", "p"])
+    if df["p"].notna().any():
+        pmap = {int(r.group): float(r.p) for r in df.itertuples() if np.isfinite(r.p)}
+        padj = _holm_bonferroni(pmap)
+        df["p_adj"] = df["group"].map(padj)
+        df["sig"] = df["p_adj"] < alpha
+    else:
+        df["p_adj"] = np.nan; df["sig"] = False
+    df["direction_raw"] = df["median"] - overall_med
+    df["direction"] = np.where(df["direction_raw"] > 0, "+", "-")
+    df["effect_abs"] = df["direction_raw"].abs()
+    return df.sort_values(["sig", "effect_abs"], ascending=[False, False])
+
+
+def build_group_mask(index: pd.DatetimeIndex, breakdown: pd.DataFrame, by: str = "month") -> pd.Series:
+    """Return a 0/1 mask series aligned to index; 1 only in significant groups per breakdown."""
+    if breakdown is None or breakdown.empty or "sig" not in breakdown:
+        return pd.Series(0.0, index=index)
+    allowed = set(int(g) for g in breakdown.loc[breakdown["sig"], "group"].dropna().astype(int).values)
+    if by == "month":
+        vals = [1.0 if m in allowed else 0.0 for m in index.month]
+    else:
+        vals = [1.0 if d in allowed else 0.0 for d in index.dayofweek]
+    return pd.Series(vals, index=index, dtype=float)
+
+
+def sigmoid(x: np.ndarray) -> np.ndarray:
+    return 1.0 / (1.0 + np.exp(-x))(x: np.ndarray) -> np.ndarray:
+    return 1.0 / (1.0 + np.exp(-x))
+
+# =============================
+# Plotting
+# =============================
+
+def _show(fig):
+    plt.show(); plt.close(fig)
+
+
+def plot_changes_timeseries(idx, z_xccy, z_diff, z_cc, z_us, country: str, tenor: str):
+    fig, axs = plt.subplots(3, 1, figsize=(12, 8), sharex=True)
+    axs[0].plot(idx, z_xccy, label=f"zΔ{country}_XCCY_{tenor}", color=COL["xccy"])
+    axs[0].plot(idx, z_diff, label="zΔDIFF", color=COL["diff"])
+    axs[0].set_title(f"Rolling‑z changes — XCCY & DIFF ({country} {tenor})")
+    axs[0].legend(loc="upper left"); _date_fmt(axs[0])
+
+    axs[1].plot(idx, z_cc, label=f"zΔ{country}ss{tenor}", color=COL["cc"])
+    axs[1].plot(idx, z_us, label=f"zΔss{tenor}", color=COL["us"])
+    axs[1].legend(loc="upper left"); _date_fmt(axs[1])
+
+    spread = z_xccy - z_diff
+    axs[2].plot(idx, spread, label="zΔXCCY − zΔDIFF (spread)", color=COL["spread"])
+    axs[2].axhline(0, linewidth=0.9, color="#555555")
+    axs[2].legend(loc="upper left"); _date_fmt(axs[2])
+
+    for ax in axs: ax.grid(True, alpha=0.3)
+    _show(fig)
+
+
+def plot_signal_fit(idx, z_xccy, z_diff, alpha: float, beta: float, country: str, tenor: str):
+    pred = alpha + beta * z_diff
+    fig, ax = plt.subplots(figsize=(12, 4))
+    ax.plot(idx, z_xccy, label="zΔXCCY (actual)", color=COL["xccy"])
+    ax.plot(idx, pred, label="β·zΔDIFF + α (fit)", color=COL["fit"])
+    ax.set_title(f"Signal fit — zΔXCCY vs β·zΔDIFF ({country} {tenor})")
+    ax.legend(loc="upper left"); _date_fmt(ax)
+    _show(fig)
+
+
+def plot_residual_zscore(idx, z_xccy, z_diff, alpha: float, beta: float, zwin: int, country: str, tenor: str):
+    resid = z_xccy - (alpha + beta * z_diff)
+    zres = rolling_z(resid, zwin)
+    fig, ax = plt.subplots(figsize=(12, 3.6))
+    ax.plot(idx, zres, color=COL["bars"])
+    for y in (0, 2, -2):
+        ax.axhline(y, linewidth=0.9, linestyle="--", color="#777777")
+    ax.set_title(f"Residual rolling‑z — {country} {tenor}")
+    _date_fmt(ax)
+    _show(fig)
+
+
+def plot_monthly_box(series: pd.Series, title: str):
+    s = series.dropna()
+    if s.empty:
+        return
+    months = s.index.month
+    data = [s[months == m].values for m in range(1, 13)]
+    fig, ax = plt.subplots(figsize=(12, 4))
+    ax.boxplot(data, showfliers=False)
+    ax.set_xticklabels(["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"])
+    ax.set_title(title)
+    _show(fig)
+
+
+def plot_rolling_corr(x: pd.Series, y: pd.Series, win: int, title: str):
+    df = pd.concat([x, y], axis=1).dropna()
+    if df.shape[0] < win + 5:
+        return
+    rc = df.iloc[:, 0].rolling(win).corr(df.iloc[:, 1])
+    fig, ax = plt.subplots(figsize=(12, 3.6))
+    ax.plot(rc.index, rc.values, color=COL["bars"])
+    ax.axhline(0, linewidth=0.9, color="#555555")
+    ax.set_title(title); _date_fmt(ax)
+    _show(fig)
+
+
+def rolling_beta(x: pd.Series, y: pd.Series, win: int) -> pd.Series:
+    df = pd.concat([x, y], axis=1).dropna()
+    if df.shape[0] < win + 5:
+        return pd.Series(index=df.index, dtype=float)
+    cov = df.iloc[:, 0].rolling(win).cov(df.iloc[:, 1])
+    var = df.iloc[:, 0].rolling(win).var()
+    beta = cov / var
+    beta.name = "rolling_beta"
+    return beta
+
+
+def plot_rolling_beta(x: pd.Series, y: pd.Series, win: int, title: str):
+    b = rolling_beta(x, y, win)
+    if b.empty:
+        return
+    fig, ax = plt.subplots(figsize=(12, 3.2))
+    ax.plot(b.index, b.values)
+    ax.axhline(0, linewidth=0.9, color="#555555")
+    ax.set_title(title); _date_fmt(ax)
+    _show(fig)
+
+
+def plot_xcorr(lags: np.ndarray, corrs: np.ndarray, pvals: np.ndarray, best_lag: float, best_corr: float, pval: float, title: str, xlabel: str):
+    fig, ax = plt.subplots(figsize=(12, 3.6))
+    ax.bar(lags, corrs, width=0.9, color=COL["bars"])
+    ax.axvline(0, linewidth=0.9, color="#555555")
+    if np.isfinite(best_corr) and np.isfinite(best_lag):
+        ax.axvline(best_lag, linestyle='--', linewidth=1.1, color=COL["fit"])
+        ax.text(best_lag, best_corr, f"lag={int(best_lag)}, r={best_corr:.2f}, p={pval:.3f}", ha='center', va='bottom', fontsize=9)
+    ax.set_title(title); ax.set_xlabel(xlabel)
+    _show(fig)
+
+
+def plot_heatmap(mat: pd.DataFrame, title: str):
+    if mat.empty:
+        return
+    data = np.ma.masked_invalid(mat.values)
+    fig, ax = plt.subplots(figsize=(0.6 * mat.shape[1] + 3, 0.6 * mat.shape[0] + 3))
+    cax = ax.imshow(data, vmin=-1, vmax=1, cmap="coolwarm")
+    ax.set_xticks(np.arange(mat.shape[1])); ax.set_xticklabels(mat.columns, rotation=45, ha='right')
+    ax.set_yticks(np.arange(mat.shape[0])); ax.set_yticklabels(mat.index)
+    ax.set_title(title)
+    fig.colorbar(cax, ax=ax, fraction=0.046, pad=0.04)
+    fig.tight_layout(); _show(fig)
+
+# New: Seasonality breakdown plots (months) and Lead-lag month profile
+
+def plot_seasonality_month_bars(breakdown: pd.DataFrame, title: str, by: str = "month"):
+    if breakdown is None or breakdown.empty:
+        return
+    labels = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"] if by=="month" else ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
+    x = breakdown["group"].values
+    y = breakdown["direction_raw"].values
+    sig = breakdown.get("sig", pd.Series([False]*len(breakdown))).values
+    colors = np.where(y >= 0, COL["bars"], COL["neg"])  # up vs down tint
+    fig, ax = plt.subplots(figsize=(12, 4))
+    ax.bar(x, y, color=colors)
+    ax.axhline(0, linewidth=0.9, color="#555555")
+    for xi, yi, s in zip(x, y, sig):
+        if s and np.isfinite(yi):
+            ax.text(xi, yi + (0.02 if yi>=0 else -0.02), "*", ha='center', va='bottom' if yi>=0 else 'top', fontsize=12)
+    ax.set_xticks(x)
+    ax.set_xticklabels([labels[int(i-1)] if by=="month" else labels[int(i)] for i in x])
+    ax.set_title(title)
+    _show(fig)
+
+
+def plot_leadlag_month_profile(df: pd.DataFrame, k: int, title: str):
+    if df is None or df.empty:
+        return
+    labels = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+    x = df["month"].values
+    y = df["r_at_k"].values
+    colors = np.where(y >= 0, COL["bars"], COL["neg"])
+    fig, ax = plt.subplots(figsize=(12, 4))
+    ax.bar(x, y, color=colors)
+    ax.axhline(0, linewidth=0.9, color="#555555")
+    for xi, ri, pi in zip(x, y, df["p"].values):
+        if np.isfinite(ri) and np.isfinite(pi) and pi < 0.05:
+            ax.text(xi, ri + (0.02 if ri>=0 else -0.02), "*", ha='center', va='bottom' if ri>=0 else 'top', fontsize=12)
+    ax.set_xticks(x); ax.set_xticklabels([labels[int(i-1)] for i in x])
+    ax.set_title(f"{title} (lag k={int(k)})")
+    _show(fig)
+
+
+def plot_signals_panel(sig_df: pd.DataFrame, composite: pd.Series, country: str, tenor: str):
+    df = pd.concat([sig_df, composite], axis=1).dropna()
+    if df.empty:
+        return
+    fig, axs = plt.subplots(5, 1, figsize=(12, 10), sharex=True)
+    names = ["resid_z", "ecz", "seasonal_z_m", "leadlag", "composite"]
+    titles = ["Residual‑z", "ECM‑z", "Seasonality (month)", "Lead‑lag", "Composite"]
+    colors = [COL["bars"], COL["fit"], COL["diff"], COL["cc"], COL["us"]]
+    for i, (nm, ttl, col) in enumerate(zip(names, titles, colors)):
+        if nm in df.columns:
+            axs[i].plot(df.index, df[nm].values, color=col)
+            for y in (0, 2, -2):
+                axs[i].axhline(y, linewidth=0.8, linestyle="--", color="#999999")
+            axs[i].set_title(ttl); _date_fmt(axs[i])
+    fig.suptitle(f"Signals — {country} {tenor}"); _show(fig)
+
+# =============================
+# Lead‑lag monthly profile helper
+# =============================
+
+def leadlag_month_profile(x: pd.Series, y: pd.Series, k: int, min_n: int = 15) -> pd.DataFrame:
+    """For each month, compute corr(y_t, x_{t−k}). Return rows: month, n, r_at_k, p."""
+    if k < 0:
+        return leadlag_month_profile(y, x, -k, min_n=min_n)
+    xs = x.shift(k)
+    xs, ys = overlap(xs, y)
+    if len(xs) < 60:
+        return pd.DataFrame()
+    months = xs.index.month
+    out = []
+    for m in range(1, 13):
+        xm = xs[months == m]
+        ym = ys[months == m]
+        xm, ym = overlap(xm, ym)
+        if len(xm) < min_n:
+            out.append((m, len(xm), np.nan, np.nan)); continue
+        r, p, _ = corr_and_p(xm, ym)
+        out.append((m, len(xm), r, p))
+    return pd.DataFrame(out, columns=["month", "n", "r_at_k", "p"]).sort_values("month")
+
+# =============================
+# Pair analysis + signals
+# =============================
+
+@dataclass
+class PairZResult:
+    country: str
+    tenor: str
+    n_obs: int
+    zwin: int
+    # Corrs
+    r_zB_zDIFF: float; p_zB_zDIFF: float; n_zB_zDIFF: int
+    r_zB_zCC: float;   p_zB_zCC: float;   n_zB_zCC: int
+    r_zB_zUS: float;   p_zB_zUS: float;   n_zB_zUS: int
+    # Robust OLS (HAC) on z-space
+    alpha: float; beta: float; r2: float; t_beta: float; p_beta: float; n_ols: int
+    # Additional OLS: XCCY on CC_SS and US_SS in z-space
+    alpha_cc: float; beta_cc: float; r2_cc: float; t_cc: float; p_cc: float; n_ols_cc: int
+    alpha_us: float; beta_us: float; r2_us: float; t_us: float; p_us: float; n_ols_us: int
+    # AR(1) on zΔ
+    phi_zB: float; p_phi_zB: float; hl_zB: float
+    phi_zDIFF: float; p_phi_zDIFF: float; hl_zDIFF: float
+    # Lead–lag (DIFF→XCCY) and also CC→XCCY, US→XCCY
+    best_lag: float; best_corr: float; pval_bestlag: float; n_used_xcorr: int
+    best_lag_cc: float; best_corr_cc: float; pval_bestlag_cc: float; n_used_xcorr_cc: int
+    best_lag_us: float; best_corr_us: float; pval_bestlag_us: float; n_used_xcorr_us: int
+    # Seasonality p-vals
+    p_kw_zB_m: float; p_kw_zDIFF_m: float
+    p_kw_zB_d: float; p_kw_zDIFF_d: float
+    # Cointegration / ECM
+    coint_p: float
+    gamma_ecm: float; t_gamma: float; p_gamma: float
+    # Latest signals
+    last_signal_regz: float; last_signal_ecm: float; last_signal_seasonal_m: float; last_signal_seasonal_d: float; last_signal_ll: float; last_signal_composite: float
+
+
+def _fmt_lag(k: float) -> str:
+    return "nan" if not np.isfinite(k) else f"{int(k):3d}"
+
+def _fmt_f(x: float) -> str:
+    return "  nan" if not np.isfinite(x) else f"{x:6.3f}"
+
+
+def print_pairz_summary(res: PairZResult):
+    print("\n" + "=" * 118)
+    print(f"{res.country} {res.tenor} — Δ→rolling‑z (window={res.zwin}) analysis (n={res.n_obs})")
+    print("-" * 118)
+    print(f"Corr(zΔXCCY, zΔDIFF) = {_fmt_f(res.r_zB_zDIFF)}  p={_fmt_f(res.p_zB_zDIFF)}   n={res.n_zB_zDIFF}")
+    print(f"Corr(zΔXCCY, zΔCC  ) = {_fmt_f(res.r_zB_zCC)}  p={_fmt_f(res.p_zB_zCC)}   n={res.n_zB_zCC}")
+    print(f"Corr(zΔXCCY, zΔUS  ) = {_fmt_f(res.r_zB_zUS)}  p={_fmt_f(res.p_zB_zUS)}   n={res.n_zB_zUS}")
+    print(f"HAC OLS zΔXCCY ~ α + β·zΔDIFF:  β={_fmt_f(res.beta)}  tβ={_fmt_f(res.t_beta)}  pβ={_fmt_f(res.p_beta)}  R²={_fmt_f(res.r2)}  n={res.n_ols}")
+    print(f"HAC OLS zΔXCCY ~ α + β·zΔCC  :  β={_fmt_f(res.beta_cc)}  tβ={_fmt_f(res.t_cc)}  pβ={_fmt_f(res.p_cc)}  R²={_fmt_f(res.r2_cc)}  n={res.n_ols_cc}")
+    print(f"HAC OLS zΔXCCY ~ α + β·zΔUS  :  β={_fmt_f(res.beta_us)}  tβ={_fmt_f(res.t_us)}  pβ={_fmt_f(res.p_us)}  R²={_fmt_f(res.r2_us)}  n={res.n_ols_us}")
+    print(f"Lead‑lag DIFF→XCCY: best_lag={_fmt_lag(res.best_lag)}    r={_fmt_f(res.best_corr)}    p(adj)={_fmt_f(res.pval_bestlag)}    n={res.n_used_xcorr}")
+    print(f"Lead‑lag  CC →XCCY: best_lag={_fmt_lag(res.best_lag_cc)}  r={_fmt_f(res.best_corr_cc)}  p={_fmt_f(res.pval_bestlag_cc)}  n={res.n_used_xcorr_cc}")
+    print(f"Lead‑lag  US →XCCY: best_lag={_fmt_lag(res.best_lag_us)}  r={_fmt_f(res.best_corr_us)}  p={_fmt_f(res.pval_bestlag_us)}  n={res.n_used_xcorr_us}")
+    print(f"AR(1) zΔXCCY:  φ={_fmt_f(res.phi_zB)}  p={_fmt_f(res.p_phi_zB)}  hl(|φ|)={0.0 if not np.isfinite(res.hl_zB) else round(res.hl_zB, 1)}")
+    print(f"AR(1) zΔDIFF:  φ={_fmt_f(res.phi_zDIFF)}  p={_fmt_f(res.p_phi_zDIFF)}  hl(|φ|)={0.0 if not np.isfinite(res.hl_zDIFF) else round(res.hl_zDIFF, 1)}")
+    print(f"Seasonality p‑vals (Kruskal on zΔ):  MONTH  XCCY={_fmt_f(res.p_kw_zB_m)}  DIFF={_fmt_f(res.p_kw_zDIFF_m)}  |  DOW  XCCY={_fmt_f(res.p_kw_zB_d)}  DIFF={_fmt_f(res.p_kw_zDIFF_d)}")
+    print(f"Cointegration (levels XCCY~DIFF): p={_fmt_f(res.coint_p)}; ECM γ={_fmt_f(res.gamma_ecm)}  tγ={_fmt_f(res.t_gamma)}  pγ={_fmt_f(res.p_gamma)}")
+    print("Signals (latest):")
+    print(f"  residual‑z        : {_fmt_f(res.last_signal_regz)}")
+    print(f"  ECM‑z             : {_fmt_f(res.last_signal_ecm)}")
+    print(f"  seasonality‑z (m) : {_fmt_f(res.last_signal_seasonal_m)}")
+    print(f"  seasonality‑z (d) : {_fmt_f(res.last_signal_seasonal_d)}")
+    print(f"  lead‑lag (DIFF)   : {_fmt_f(res.last_signal_ll)}")
+    print(f"  COMPOSITE         : {_fmt_f(res.last_signal_composite)}")
+
+
+def analyze_pair_rollingz(
+    allData: pd.DataFrame, country: str, tenor: str, *,
+    max_lag: int = 60, zwin: int = 60, rolling: int = 60,
+    flip_basis: bool = False, do_plots: bool = True,
+    hac_lags: int = 5,
+    sig_level: float = 0.05,
+    diff_mode: str = "simple", winsor_limits: Optional[Tuple[float, float]] = (0.01, 0.01)
+) -> Optional[PairZResult]:
+
+    # Columns (no resample here — batch runner already did it)
+    us_col = f"ss{tenor}"; cc_col = f"{country}ss{tenor}"; xccy_col = f"{country}_XCCY_{tenor}"
+    for col in (us_col, cc_col, xccy_col):
+        if col not in allData.columns:
+            print(f"[WARN] {country}-{tenor}: missing {col}; skipping")
+            return None
+
+    sub = allData[[us_col, cc_col, xccy_col]].copy()
+    sub.columns = ["US_SS", "CC_SS", "XCCY"]
+
+    # Δ series — explicit diff construction
+    d = pd.DataFrame(index=sub.index)
+    d["US_SS"] = diff_series(sub["US_SS"], diff_mode)
+    d["CC_SS"] = diff_series(sub["CC_SS"], diff_mode)
+    d["XCCY"]  = diff_series(sub["XCCY"],  diff_mode)
+    d["DIFF"]  = diff_series(sub["CC_SS"] - sub["US_SS"], diff_mode)
+    if flip_basis:
+        d["XCCY"] = -d["XCCY"]
+
+    # Optional winsor on Δ
+    if winsor_limits is not None:
+        for c in ["US_SS","CC_SS","XCCY","DIFF"]:
+            d[c] = winsorize_series(d[c], winsor_limits)
+
+    # Rolling z on Δ (std‑z)
+    z_xccy = rolling_z(d["XCCY"], zwin)
+    z_us   = rolling_z(d["US_SS"], zwin)
+    z_cc   = rolling_z(d["CC_SS"], zwin)
+    z_diff = rolling_z(d["DIFF"], zwin)
+
+    # Correlations (z‑space)
+    r1, p1, n1 = corr_and_p(z_xccy, z_diff)
+    r2, p2, n2 = corr_and_p(z_xccy, z_cc)
+    r3, p3, n3 = corr_and_p(z_xccy, z_us)
+
+    # HAC OLS in z‑space (core: DIFF)
+    ols = ols_xy_hac(z_diff, z_xccy, hac_lags=hac_lags)
+    alpha, beta = ols["alpha"], ols["beta"]
+    resid = z_xccy - (alpha + beta * z_diff)
+    resid_z = rolling_z(resid, zwin)
+
+    # Additional HAC OLS in z‑space: XCCY on CC_SS and on US_SS
+    ols_cc = ols_xy_hac(z_cc, z_xccy, hac_lags=hac_lags)
+    ols_us = ols_xy_hac(z_us, z_xccy, hac_lags=hac_lags)
+
+    # AR(1) on zΔ
+    phi_B, p_phi_B, _, hl_B = ar1_phi(z_xccy)
+    phi_D, p_phi_D, _, hl_D = ar1_phi(z_diff)
+
+    # Lead‑lag (DIFF→XCCY) and also (CC→XCCY), (US→XCCY)
+    lags, corrs, pvals, best_k, best_r, pbest, n_used = cross_correlation_lags(z_diff, z_xccy, max_lag)
+    lags_cc, corrs_cc, pvals_cc, best_k_cc, best_r_cc, pbest_cc, n_used_cc = cross_correlation_lags(z_cc, z_xccy, max_lag)
+    lags_us, corrs_us, pvals_us, best_k_us, best_r_us, pbest_us, n_used_us = cross_correlation_lags(z_us, z_xccy, max_lag)
+
+    # Lead‑lag signals: apply Bonferroni across tested lags
+    leadlag_now = pd.Series(0.0, index=z_diff.index)
+    leadlag_aligned = pd.Series(0.0, index=z_diff.index)
+    m_lags = 2 * max_lag + 1
+    pbest_adj = pbest * m_lags if np.isfinite(pbest) else np.nan
+    if np.isfinite(best_k) and best_k > 0 and np.isfinite(pbest_adj) and pbest_adj < sig_level and np.isfinite(best_r):
+        leadlag_now = np.sign(best_r) * z_diff
+        leadlag_aligned = leadlag_now.shift(int(best_k))  # aligns with y_t for visual comparison
+
+    # Seasonality (month & DOW)
+    p_kw_B_m = month_kruskal(z_xccy); p_kw_D_m = month_kruskal(z_diff)
+    p_kw_B_d = dow_kruskal(z_xccy);   p_kw_D_d = dow_kruskal(z_diff)
+
+    # Forward‑looking seasonal templates (FOLLOW only) with significance gating
+seasonal_signal_m_raw = seasonal_template_signal(z_xccy, by="month")
+seasonal_signal_d_raw = seasonal_template_signal(z_xccy, by="dow")
+# Build significance breakdowns & masks on XCCY
+B_m = seasonality_breakdown(z_xccy, by="month", alpha=sig_level) if (np.isfinite(p_kw_B_m) and p_kw_B_m < sig_level) else pd.DataFrame()
+B_d = seasonality_breakdown(z_xccy, by="dow",   alpha=sig_level) if (np.isfinite(p_kw_B_d) and p_kw_B_d < sig_level) else pd.DataFrame()
+mask_m = build_group_mask(z_xccy.index, B_m, by="month")
+mask_d = build_group_mask(z_xccy.index, B_d, by="dow")
+seasonal_signal_m = (seasonal_signal_m_raw * mask_m).rename("seasonal_z_m")
+seasonal_signal_d = (seasonal_signal_d_raw * mask_d).rename("seasonal_z_d")
+
+    # If seasonality present, print and plot WHICH months drive it
+if np.isfinite(p_kw_B_m) and p_kw_B_m < sig_level and B_m is not None and not B_m.empty:
+    ups = ", ".join(["Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split()[g-1] for g in B_m.loc[B_m["sig"] & (B_m["direction_raw"]>0),"group"].astype(int)])
+    dns = ", ".join(["Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split()[g-1] for g in B_m.loc[B_m["sig"] & (B_m["direction_raw"]<0),"group"].astype(int)])
+    print(f"  [XCCY] Significant MONTH seasonality → Up: [{ups}]  Down: [{dns}] (Holm α={sig_level})")
+    plot_seasonality_month_bars(B_m, f"Seasonality by month — zΔXCCY ({country} {tenor})", by="month")
+    if np.isfinite(p_kw_D_m) and p_kw_D_m < sig_level:
+    detD = seasonality_breakdown(z_diff, by="month", alpha=sig_level)
+    if not detD.empty:
+        ups = ", ".join(["Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split()[g-1] for g in detD.loc[detD["sig"] & (detD["direction_raw"]>0),"group"].astype(int)])
+        dns = ", ".join(["Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split()[g-1] for g in detD.loc[detD["sig"] & (detD["direction_raw"]<0),"group"].astype(int)])
+        print(f"  [DIFF] Significant MONTH seasonality → Up: [{ups}]  Down: [{dns}] (Holm α={sig_level})")
+        plot_seasonality_month_bars(detD, f"Seasonality by month — zΔDIFF ({country} {tenor})", by="month")
+
+    # Lead‑lag seasonality by month: if a causal best lag exists, show + plot which months carry it
+    if np.isfinite(best_k) and best_k > 0 and np.isfinite(pbest_adj) and pbest_adj < sig_level and np.isfinite(best_r):
+        ll_months = leadlag_month_profile(z_diff, z_xccy, int(best_k), min_n=max(15, zwin//2))
+        if not ll_months.empty and ll_months["r_at_k"].notna().any():
+            top_ll = ll_months.dropna().head(6)
+            pretty = ", ".join([f"{['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][int(r.month)-1]}(r={r.r_at_k:.2f},p={r.p:.3f},n={int(r.n)})" for r in top_ll.itertuples()])
+            print(f"  [LeadLag] Monthly profile at k={int(best_k)}: {pretty}")
+            plot_leadlag_month_profile(ll_months, int(best_k), f"Lead‑lag monthly profile: zΔDIFF→zΔXCCY ({country} {tenor})")
+
+    # ECM / cointegration on levels (DIFF vs XCCY)
+    lev = pd.DataFrame({"XCCY": sub["XCCY"], "DIFF": (sub["CC_SS"] - sub["US_SS"]) }).dropna()
+    if len(lev) > 120:
+        lvl_res = sm.OLS(lev["XCCY"].values, sm.add_constant(lev["DIFF"].values)).fit()
+        ec_series = pd.Series(lvl_res.resid, index=lev.index)
+        try:
+            coint_p = float(adfuller(ec_series.dropna(), autolag="AIC")[1])
+        except Exception:
+            coint_p = np.nan
+        sr = pd.DataFrame({"dX": lev["XCCY"].diff(), "dD": lev["DIFF"].diff(), "EC1": ec_series.shift(1)}).dropna()
+        if len(sr) >= 30:
+            ecm_res = sm.OLS(sr["dX"].values, sm.add_constant(sr[["EC1","dD"]].values)).fit(cov_type="HAC", cov_kwds={"maxlags": hac_lags})
+            gamma = float(ecm_res.params[1]); t_gamma = float(ecm_res.tvalues[1]); p_gamma = float(ecm_res.pvalues[1])
+            ec_z_full = rolling_z(ec_series, max(zwin, 120)).reindex(sub.index)
+            # ΔX ≈ γ·EC_{t−1} + β·ΔD  ⇒ use sign(γ)·EC_z as the ECM signal direction
+            if (np.isfinite(coint_p) and coint_p < max(0.10, sig_level)) and (np.isfinite(p_gamma) and p_gamma < max(0.10, sig_level)):
+                ecz_signal = (np.sign(gamma)) * ec_z_full.shift(1)
+            else:
+                ecz_signal = pd.Series(0.0, index=sub.index)
+        else:
+            gamma = np.nan; t_gamma = np.nan; p_gamma = np.nan
+            ecz_signal = pd.Series(0.0, index=sub.index)
+    else:
+        coint_p = np.nan; gamma = np.nan; t_gamma = np.nan; p_gamma = np.nan
+        ecz_signal = pd.Series(0.0, index=sub.index)
+
+    # Composite signal — evidence‑weighted
+    def w_from_p(p):
+        if not np.isfinite(p):
+            return 0.0
+        return float(np.clip(1.0 - p, 0.0, 1.0))
+
+    raw_w = {
+        "resid_z": w_from_p(ols["p_beta"]),
+        "ecz": w_from_p(p_gamma) if np.isfinite(p_gamma) else 0.0,
+        "seasonal_z_m": w_from_p(p_kw_B_m),
+        "seasonal_z_d": w_from_p(p_kw_B_d),
+        "leadlag": w_from_p(pbest_adj) if np.isfinite(pbest_adj) and np.isfinite(best_k) and best_k > 0 else 0.0,
+    }
+    smoothed = {k: float(sigmoid(3 * (v - 0.5))) for k, v in raw_w.items()}
+    total = sum(smoothed.values())
+    if total == 0:
+        smoothed = {"resid_z": 1.0, "ecz": 0.0, "seasonal_z_m": 0.0, "seasonal_z_d": 0.0, "leadlag": 0.0}
+        total = 1.0
+    weights = pd.Series({k: v / total for k, v in smoothed.items()})
+
+    # Pack signals
+    resid_z = resid_z.rename("resid_z")
+    ecz_signal = ecz_signal.rename("ecz")
+    # seasonal_signal_m/d already renamed above after gating
+    leadlag_sig = leadlag_now.rename("leadlag")
+
+    sig_df = pd.concat([resid_z, ecz_signal, seasonal_signal_m, seasonal_signal_d, leadlag_sig], axis=1)
+    composite = (sig_df.fillna(0.0) * weights).sum(axis=1).rename("composite")
+
+    # Print composite contribution breakdown (latest)
+    if composite.notna().any():
+        last_row = sig_df.fillna(0.0).iloc[-1]
+        contrib = (last_row * weights).to_dict()
+        print("  [Composite contributions | last]: " + ", ".join([f"{k}={v:.2f}" for k, v in contrib.items()]))
+
+    # Plots (always show if requested; no saving)
+    if do_plots:
+        plot_changes_timeseries(z_xccy.index, z_xccy, z_diff, z_cc, z_us, country, tenor)
+        plot_signal_fit(z_xccy.index, z_xccy, z_diff, alpha, beta, country, tenor)
+        plot_residual_zscore(z_xccy.index, z_xccy, z_diff, alpha, beta, zwin, country, tenor)
+        plot_monthly_box(z_xccy, f"Monthly box — zΔXCCY ({country} {tenor})")
+        plot_monthly_box(z_diff,  f"Monthly box — zΔDIFF ({country} {tenor})")
+        plot_rolling_corr(z_xccy, z_diff, rolling, f"Rolling corr (w={rolling}) — zΔXCCY vs zΔDIFF: {country} {tenor}")
+        lags_, corrs_, pvals_, best_k_, best_r_, pbest_, _ = cross_correlation_lags(z_diff, z_xccy, max_lag)
+        plot_xcorr(lags_, corrs_, pvals_, best_k_, best_r_, pbest_, f"Cross‑corr: zΔXCCY vs zΔDIFF ({country} {tenor})", "lag (periods; +ve: zΔDIFF leads zΔXCCY)")
+        lags_, corrs_, pvals_, best_k_, best_r_, pbest_, _ = cross_correlation_lags(z_cc, z_xccy, max_lag)
+        plot_xcorr(lags_, corrs_, pvals_, best_k_, best_r_, pbest_, f"Cross‑corr: zΔXCCY vs zΔCC ({country} {tenor})", "lag (periods; +ve: zΔCC leads zΔXCCY)")
+        lags_, corrs_, pvals_, best_k_, best_r_, pbest_, _ = cross_correlation_lags(z_us, z_xccy, max_lag)
+        plot_xcorr(lags_, corrs_, pvals_, best_k_, best_r_, pbest_, f"Cross‑corr: zΔXCCY vs zΔUS ({country} {tenor})",  "lag (periods; +ve: zΔUS leads zΔXCCY)")
+        plot_rolling_beta(z_diff, z_xccy, rolling, f"Rolling β (w={rolling}) — zΔXCCY ~ zΔDIFF: {country} {tenor}")
+        # Optional: compare aligned lead-lag predictor to actual
+        if leadlag_aligned.notna().any():
+            fig, ax = plt.subplots(figsize=(12, 3.6))
+            ax.plot(z_xccy.index, z_xccy, label="zΔXCCY", color=COL["xccy"])
+            ax.plot(leadlag_aligned.index, leadlag_aligned, label=f"Lead‑lag predictor (shifted by k={int(best_k)})", color=COL["fit"])
+            ax.set_title(f"Lead‑lag aligned predictor — {country} {tenor}"); ax.legend(loc="upper left"); _date_fmt(ax); _show(fig)
+        plot_signals_panel(sig_df, composite, country, tenor)
+
+    # Pack & print
+    res = PairZResult(
+        country=country, tenor=tenor, n_obs=int(z_xccy.dropna().shape[0]), zwin=zwin,
+        r_zB_zDIFF=r1, p_zB_zDIFF=p1, n_zB_zDIFF=n1,
+        r_zB_zCC=r2,   p_zB_zCC=p2,   n_zB_zCC=n2,
+        r_zB_zUS=r3,   p_zB_zUS=p3,   n_zB_zUS=n3,
+        alpha=alpha, beta=beta, r2=ols["r2"], t_beta=ols["t_beta"], p_beta=ols["p_beta"], n_ols=ols["n"],
+        alpha_cc=ols_cc["alpha"], beta_cc=ols_cc["beta"], r2_cc=ols_cc["r2"], t_cc=ols_cc["t_beta"], p_cc=ols_cc["p_beta"], n_ols_cc=ols_cc["n"],
+        alpha_us=ols_us["alpha"], beta_us=ols_us["beta"], r2_us=ols_us["r2"], t_us=ols_us["t_beta"], p_us=ols_us["p_beta"], n_ols_us=ols_us["n"],
+        phi_zB=phi_B, p_phi_zB=p_phi_B, hl_zB=hl_B,
+        phi_zDIFF=phi_D, p_phi_zDIFF=p_phi_D, hl_zDIFF=hl_D,
+        best_lag=best_k, best_corr=best_r, pval_bestlag=pbest_adj, n_used_xcorr=n_used,
+        best_lag_cc=best_k_cc, best_corr_cc=best_r_cc, pval_bestlag_cc=pbest_cc, n_used_xcorr_cc=n_used_cc,
+        best_lag_us=best_k_us, best_corr_us=best_r_us, pval_bestlag_us=pbest_us, n_used_xcorr_us=n_used_us,
+        p_kw_zB_m=p_kw_B_m, p_kw_zDIFF_m=p_kw_D_m,
+        p_kw_zB_d=p_kw_B_d, p_kw_zDIFF_d=p_kw_D_d,
+        coint_p=coint_p, gamma_ecm=gamma, t_gamma=t_gamma, p_gamma=p_gamma,
+        last_signal_regz=float(resid_z.dropna().iloc[-1]) if resid_z.notna().any() else np.nan,
+        last_signal_ecm=float(ecz_signal.dropna().iloc[-1]) if ecz_signal.notna().any() else np.nan,
+        last_signal_seasonal_m=float(seasonal_signal_m.dropna().iloc[-1]) if seasonal_signal_m.notna().any() else np.nan,
+        last_signal_seasonal_d=float(seasonal_signal_d.dropna().iloc[-1]) if seasonal_signal_d.notna().any() else np.nan,
+        last_signal_ll=float(leadlag_now.dropna().iloc[-1]) if leadlag_now.notna().any() else np.nan,
+        last_signal_composite=float(composite.dropna().iloc[-1]) if composite.notna().any() else np.nan,
+    )
+    print_pairz_summary(res)
+    return res
+
+# =============================
+# Cross‑country diagnostics (ΔSS z‑space)
+# =============================
+
+def cross_country_corr_leadlag(
+    allData: pd.DataFrame, *, countries: List[str], tenors: List[str],
+    zwin: int = 60, max_lag: int = 60,
+    do_plots: bool = True
+) -> Dict[str, Dict[str, pd.DataFrame]]:
+    """Correlation matrices and pairwise lead‑lag on zΔ of country swap spreads per tenor."""
+    out: Dict[str, Dict[str, pd.DataFrame]] = {}
+    for tenor in tenors:
+        cols = [f"{cc}ss{tenor}" for cc in countries if f"{cc}ss{tenor}" in allData.columns]
+        if len(cols) < 2:
+            continue
+        d = allData[cols].apply(lambda s: diff_series(s, "simple"))
+        Z = pd.DataFrame({c: rolling_z(d[c], zwin) for c in cols})
+        corr = Z.corr()
+        print("\n" + "-" * 74)
+        print(f"Cross‑country corr — zΔSS ({tenor})")
+        print(corr.round(3).to_string())
+        # pairwise best lead‑lag
+        rows = []
+        for a, b in combinations(cols, 2):
+            _lags, _corrs, _pvals, best_k, best_r, pbest, n_used = cross_correlation_lags(Z[a], Z[b], max_lag)
+            rows.append((a, b, best_k, best_r, pbest, n_used))
+        rows_sorted = sorted(rows, key=lambda r: (np.isnan(r[3]), -abs(r[3])))
+        print("Top pairwise lead‑lag (abs corr):")
+        for (a, b, k, r, p, n) in rows_sorted[:10]:
+            k_str = "nan" if not np.isfinite(k) else str(int(k))
+            r_str = "nan" if not np.isfinite(r) else f"{r:.3f}"
+            p_str = "nan" if not np.isfinite(p) else f"{p:.3f}"
+            print(f"  {a} vs {b}: best_lag={k_str:>3}, r={r_str:>6}, p={p_str:>6}, n={n}")
+        out[tenor] = {"corr_zd": corr, "leadlag_rows": rows_sorted}
+        if do_plots:
+            plot_heatmap(corr, f"Cross‑country corr — zΔSS ({tenor})")
+    return out
+
+# =============================
+# Cross‑country ASW pair analysis (asset swap vs other country asset swap)
+# =============================
+
+def cross_country_ss_pairs(
+    allData: pd.DataFrame, *, countries: List[str], tenors: List[str],
+    zwin: int = 60, max_lag: int = 60
+) -> None:
+    """For each tenor, run pairwise tests between Δ→z country swap spreads.
+    Prints HAC OLS and best lead‑lag for each pair (A,B)."""
+    for tenor in tenors:
+        cols = [f"{cc}ss{tenor}" for cc in countries if f"{cc}ss{tenor}" in allData.columns]
+        if len(cols) < 2:
+            continue
+        print("\n" + "=" * 74)
+        print(f"ASW cross-country pair analysis (zΔ) — tenor {tenor}")
+        for a, b in combinations(cols, 2):
+            za = rolling_z(diff_series(allData[a], "simple"), zwin)
+            zb = rolling_z(diff_series(allData[b], "simple"), zwin)
+            # OLS A→B and B→A in z-space (symmetric corr but regression isn't)
+            ols_ab = ols_xy_hac(za, zb, hac_lags=5)
+            ols_ba = ols_xy_hac(zb, za, hac_lags=5)
+            _lags, _corrs, _pvals, k, r, p, n = cross_correlation_lags(za, zb, max_lag)
+            print(f"{a} → {b}:  β={_fmt_f(ols_ab['beta'])}  tβ={_fmt_f(ols_ab['t_beta'])}  pβ={_fmt_f(ols_ab['p_beta'])}  R²={_fmt_f(ols_ab['r2'])}  n={ols_ab['n']}")
+            print(f"{b} → {a}:  β={_fmt_f(ols_ba['beta'])}  tβ={_fmt_f(ols_ba['t_beta'])}  pβ={_fmt_f(ols_ba['p_beta'])}  R²={_fmt_f(ols_ba['r2'])}  n={ols_ba['n']}")
+            print(f"Lead‑lag best |r|: lag={_fmt_lag(k)}  r={_fmt_f(r)}  p={_fmt_f(p)}  n={n}")
+    print("\n[INFO] Cross-country ASW pair analysis complete.")
+
+# =============================
+# Batch runner (single resample here only)
+# =============================
+
+def analyze_pairs_rollingz(
+    allData: pd.DataFrame, *, countries: List[str], tenors: List[str],
+    freq: str = SETTINGS["FREQ"], zwin: int = SETTINGS["ZWIN"], rolling: int = SETTINGS["ROLLING"], max_lag: int = SETTINGS["MAX_LAG"],
+    flip_basis: bool = SETTINGS["FLIP_BASIS"], do_plots: bool = SETTINGS["DO_PLOTS"],
+    hac_lags: int = SETTINGS["HAC_LAGS"],
+    sig_level: float = SETTINGS["SIG_LEVEL"],
+    diff_mode: str = SETTINGS["DIFF_MODE"], winsor_limits: Optional[Tuple[float, float]] = SETTINGS["WINSOR_LIMITS"]
+) -> List[PairZResult]:
+    return analyze_pairs_rollingz(allData, countries=countries, tenors=tenors)
+
+if __name__ == "__main__":
+    # Intentionally no execution. Import this module and call run_full_analysis(...) yourself.
+    pass
+
+
+from Xccy_Vs_Swapspreads_Analysis import run_full_analysis, analyze_pairs_rollingz, SETTINGS
+
+countries = ["AU","JP","EU","UK"]
+tenors    = ["1y","2y","5y","10y","1y1y","3y3y"]
+
+# Quick run (daily, Δ→rolling-z analytics):
+results = run_full_analysis(allData, countries, tenors)
+
+# Or override settings:
+results = analyze_pairs_rollingz(
+    allData,
+    countries=countries, tenors=tenors,
+    freq="D", zwin=26, rolling=26, max_lag=26,
+    hac_lags=5, sig_level=0.05,
+    diff_mode="simple", winsor_limits=(0.01, 0.01),
+    flip_basis=False, do_plots=True
+)
